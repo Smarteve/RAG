@@ -1,0 +1,28 @@
+[project]
+name = "nexusrag"
+version = "0.1.0"
+description = "An async multimodal document processing and RAG engine"
+readme = "README.md"
+authors = [
+    { name = "evelyn", email = "evelynyyr11@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "pydantic>=2.13.5",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[project.scripts]
+nexusrag = "nexusrag:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]
