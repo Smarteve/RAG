@@ -7,8 +7,9 @@ from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES
 client = TestClient(app)
 
 
-def test_pdf_upload_returns_document_metadata() -> None:
-    file_contents = b"%PDF-1.7\nexample PDF contents"
+@pytest.mark.parametrize("size_bytes", [27, 1024 * 1024 + 7])
+def test_pdf_upload_returns_document_metadata(size_bytes: int) -> None:
+    file_contents = b"%PDF-" + b"x" * (size_bytes - 5)
 
     response = client.post(
         "/documents",
@@ -56,3 +57,13 @@ def test_invalid_pdf_signature_is_rejected(contents: bytes) -> None:
 
     assert response.status_code == 415
     assert response.json()["detail"] == "Uploaded content is not a valid PDF"
+
+
+def test_invalid_filename_returns_validation_error() -> None:
+    response = client.post(
+        "/documents",
+        files={"file": ("../invoice.pdf", b"%PDF-1.7\ncontents", "application/pdf")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Invalid document metadata"
