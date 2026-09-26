@@ -3,11 +3,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+MAX_DOCUMENT_SIZE_BYTES = 25 * 1024 * 1024
+
+
 class DocumentMetadata(BaseModel):
-    filename:str=Field(min_length=1,max_length=255)
+    filename: str = Field(min_length=1, max_length=255)
     media_type: Literal["application/pdf"]
-    size_bytes: int = Field(gt=0, le=25 * 1024 * 1024)
-    uploaded_at:datetime=Field(default_factory=lambda:datetime.now(UTC))
+    size_bytes: int = Field(gt=0, le=MAX_DOCUMENT_SIZE_BYTES)
+    uploaded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     source_created_at: datetime | None = None
 
     @field_validator("filename")
