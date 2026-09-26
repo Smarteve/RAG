@@ -1,12 +1,18 @@
+import logging
+
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
+from nexusrag import config
+from nexusrag.constants import CHUNK_SIZE_BYTES
 from nexusrag.schemas.document import (
     MAX_DOCUMENT_SIZE_BYTES,
     DocumentMetadata,
+    UploadDocumentResponse,
 )
+from nexusrag.storage import save_document
 
-CHUNK_SIZE_BYTES = 1024 * 1024
+logger = logging.getLogger(__name__)
 PDF_SIGNATURE = b"%PDF-"
 
 app = FastAPI(title="NexusRAG")
@@ -21,8 +27,8 @@ async def health_check() -> HealthCheckResponse:
     return HealthCheckResponse(status="ok")
 
 
-@app.post("/documents", response_model=DocumentMetadata)
-async def upload_document(file: UploadFile) -> DocumentMetadata:
+@app.post("/documents", response_model=UploadDocumentResponse, status_code=201)
+async def upload_document(file: UploadFile) -> UploadDocumentResponse:
     try:
         if file.content_type != "application/pdf":
             raise HTTPException(415, detail="Only PDF uploads are supported")
@@ -48,11 +54,19 @@ async def upload_document(file: UploadFile) -> DocumentMetadata:
                 raise HTTPException(413, detail="File must not exceed 25 MiB")
 
         # Construct after reading every chunk, but inside the validation handler.
-        return DocumentMetadata(
+        metadata = DocumentMetadata(
             filename=file.filename,
             media_type=file.content_type,
             size_bytes=total_size_bytes,
         )
+        # Storage rewinds the upload and completes the copy before returning.
+        try:
+            document_id, _ = await save_document(file, config.STORAGE_DIRECTORY)
+        except OSError as error:
+            logger.exception("Failed to save uploaded document")
+            raise HTTPException(500, detail="Could not save document") from error
+
+        return UploadDocumentResponse(document_id=document_id, metadata=metadata)
     except ValidationError as error:
         raise HTTPException(422, detail="Invalid document metadata") from error
     finally:

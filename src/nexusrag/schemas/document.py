@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -25,3 +26,8 @@ class DocumentMetadata(BaseModel):
             raise ValueError("filename must not contain a path")
 
         return cleaned
+
+
+class UploadDocumentResponse(BaseModel):
+    document_id: UUID
+    metadata: DocumentMetadata

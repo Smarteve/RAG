@@ -33,9 +33,9 @@ The planned flow is:
 4. Retrieve relevant passages when a question arrives.
 5. Generate an answer with citations to the supporting pages.
 
-The project currently has API and upload-validation foundations, tests, Docker,
-and CI configuration. Document storage, text extraction, retrieval, and AI
-answers are still to be implemented. The first RAG milestone is answering a
+The project currently has upload validation, local PDF storage, tests, Docker,
+and CI configuration. Text extraction, retrieval, and AI answers are still to
+be implemented. The first RAG milestone is answering a
 question about one text-based PDF with a supporting page citation.
 
 ## Run locally
@@ -45,6 +45,21 @@ uv run uvicorn nexusrag.main:app --reload
 ```
 
 Then open <http://127.0.0.1:8000/docs>.
+
+`POST /documents` saves accepted PDFs and returns `201 Created` with
+`document_id` and nested `metadata`. Files are saved as `<document_id>.pdf` in
+`data/documents` by default. Metadata is returned but is not yet persisted.
+
+To choose another directory, set the environment variable before starting:
+
+```bash
+NEXUSRAG_STORAGE_DIR=/tmp/nexusrag-documents uv run uvicorn nexusrag.main:app --reload
+```
+
+Relative storage paths are resolved from the working directory at startup.
+Local `data/` is ignored by Git. In Docker, mount a volume at `/app/data/documents`
+to keep uploads when replacing the container; the directory must be writable by
+the container user (UID 10001).
 
 ## Checks and CI
 
