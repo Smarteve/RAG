@@ -4,9 +4,11 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, NameObject
+from starlette.datastructures import Headers
 
 from nexusrag import config, main, storage
 from nexusrag.constants import CHUNK_SIZE_BYTES
@@ -298,3 +300,81 @@ def test_extraction_and_both_storage_helpers_run_outside_event_loop(
 
     assert response.status_code == 201
     assert calls == ["pdf", "extract", "save"]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [
+        ("success", None),
+        ("invalid_media_type", 415),
+        ("missing_filename", 422),
+        ("invalid_metadata", 422),
+        ("pdf_storage_failure", 500),
+        ("json_storage_failure", 500),
+        ("parse_failure", None),
+    ],
+)
+def test_endpoint_closes_upload_on_success_and_handled_failures(
+    case: str,
+    expected_status: int | None,
+    storage_directory: Path,
+    extraction_directory: Path,
+) -> None:
+    filename = "sample.pdf"
+    media_type = "application/pdf"
+    contents = SAMPLE_PDF.read_bytes()
+    if case == "invalid_media_type":
+        media_type = "text/plain"
+    elif case == "missing_filename":
+        filename = None
+    elif case == "invalid_metadata":
+        filename = "../sample.pdf"
+    elif case == "pdf_storage_failure":
+        storage_directory.write_bytes(b"not a directory")
+    elif case == "json_storage_failure":
+        extraction_directory.write_bytes(b"not a directory")
+    elif case == "parse_failure":
+        contents = b"%PDF-1.4\nbroken\n"
+
+    source = BytesIO(contents)
+    upload = UploadFile(
+        file=source,
+        filename=filename,
+        headers=Headers({"content-type": media_type}),
+    )
+    # Call the handler directly: this proves its finally block closes the file,
+    # independently of FastAPI's own multipart cleanup.
+    if expected_status is None:
+        result = asyncio.run(main.upload_document(upload))
+        expected_extraction = "failed" if case == "parse_failure" else "completed"
+        assert result.extraction_status == expected_extraction
+    else:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(main.upload_document(upload))
+        assert exc.value.status_code == expected_status
+
+    assert source.closed
+    if case in {"invalid_media_type", "missing_filename", "invalid_metadata"}:
+        assert not storage_directory.exists()
+        assert not extraction_directory.exists()
+
+
+def test_endpoint_closes_upload_when_unexpected_error_propagates(monkeypatch) -> None:
+    error = RuntimeError("Unexpected failure")
+
+    def fail_extraction(path):
+        raise error
+
+    monkeypatch.setattr(main, "extract_pages", fail_extraction)
+    source = BytesIO(SAMPLE_PDF.read_bytes())
+    upload = UploadFile(
+        file=source,
+        filename="sample.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(main.upload_document(upload))
+
+    assert exc.value is error
+    assert source.closed

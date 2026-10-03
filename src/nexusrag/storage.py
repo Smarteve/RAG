@@ -108,3 +108,6 @@ def _remove_temporary_file(path: Path, kind: str) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         logger.exception("Could not remove temporary %s %s", kind, path)
+
+
+def load_extraction(document_id: UUID, extraction_directory: Path)
