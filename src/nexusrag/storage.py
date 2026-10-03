@@ -110,8 +110,20 @@ def _remove_temporary_file(path: Path, kind: str) -> None:
         logger.exception("Could not remove temporary %s %s", kind, path)
 
 
-def load_extraction(
+async def load_extraction(
     document_id: UUID, extraction_directory: Path
 ) -> DocumentExtraction:
-    """Placeholder for the next storage assignment."""
-    raise NotImplementedError("Loading saved extraction results is not implemented yet")
+    return await run_in_threadpool(_load_extraction, document_id, extraction_directory)
+
+
+def _load_extraction(
+    document_id: UUID, extraction_directory: Path
+) -> DocumentExtraction:
+
+    source = extraction_directory / f"{document_id}.json"
+    json_text = source.read_text(encoding="utf-8")
+    extraction = DocumentExtraction.model_validate_json(json_text)
+    if extraction.document_id != document_id:
+        raise ValueError("Stored extraction document ID does not match requested ID")
+
+    return extraction
