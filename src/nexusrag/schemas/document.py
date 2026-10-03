@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from nexusrag.schemas.extraction import ExtractionErrorCode, ExtractionStatus
+
 MAX_DOCUMENT_SIZE_BYTES = 25 * 1024 * 1024
 
 
@@ -31,3 +33,6 @@ class DocumentMetadata(BaseModel):
 class UploadDocumentResponse(BaseModel):
     document_id: UUID
     metadata: DocumentMetadata
+    extraction_status: ExtractionStatus
+    page_count: int | None = Field(ge=0)
+    extraction_error: ExtractionErrorCode | None = None

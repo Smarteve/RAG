@@ -19,7 +19,8 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
 RUN useradd --create-home --uid 10001 appuser
-RUN mkdir -p /app/data/documents && chown appuser:appuser /app/data/documents
+RUN mkdir -p /app/data/documents /app/data/extracted \
+    && chown appuser:appuser /app/data /app/data/documents /app/data/extracted
 USER appuser
 
 EXPOSE 8000

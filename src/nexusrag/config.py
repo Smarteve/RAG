@@ -7,3 +7,10 @@ STORAGE_DIRECTORY = (
     .expanduser()
     .resolve()
 )
+
+
+EXTRACTION_DIRECTORY = (
+    Path(os.environ.get("NEXUSRAG_EXTRACTION_DIR", "data/extracted"))
+    .expanduser()
+    .resolve()
+)
