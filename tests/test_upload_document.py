@@ -15,6 +15,7 @@ from nexusrag.constants import CHUNK_SIZE_BYTES
 from nexusrag.main import app
 from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES
 from nexusrag.schemas.extraction import DocumentExtraction
+from nexusrag.services import ingestion
 
 client = TestClient(app)
 SAMPLE_PDF = Path(__file__).resolve().parents[1] / "examples/employee-handbook.pdf"
@@ -211,7 +212,7 @@ def test_source_read_failure_is_recorded_without_exposing_internal_error(
     def fail_read(path: Path):
         raise PermissionError("Private server path /internal/storage")
 
-    monkeypatch.setattr(main, "extract_pages", fail_read)
+    monkeypatch.setattr(ingestion, "extract_pages", fail_read)
     contents = SAMPLE_PDF.read_bytes()
     response = client.post(
         "/documents", files={"file": ("sample.pdf", contents, "application/pdf")}
@@ -267,7 +268,7 @@ def test_blank_pdf_is_successful_extraction() -> None:
 def test_extraction_and_both_storage_helpers_run_outside_event_loop(
     monkeypatch,
 ) -> None:
-    original_extract = main.extract_pages
+    original_extract = ingestion.extract_pages
     original_save_document = storage._save_document
     original_save = storage._save_extraction
     calls = []
@@ -290,7 +291,7 @@ def test_extraction_and_both_storage_helpers_run_outside_event_loop(
         calls.append("save")
         return original_save(extraction, directory)
 
-    monkeypatch.setattr(main, "extract_pages", extract_in_worker)
+    monkeypatch.setattr(ingestion, "extract_pages", extract_in_worker)
     monkeypatch.setattr(storage, "_save_document", save_pdf_in_worker)
     monkeypatch.setattr(storage, "_save_extraction", save_in_worker)
     response = client.post(
@@ -365,7 +366,7 @@ def test_endpoint_closes_upload_when_unexpected_error_propagates(monkeypatch) ->
     def fail_extraction(path):
         raise error
 
-    monkeypatch.setattr(main, "extract_pages", fail_extraction)
+    monkeypatch.setattr(ingestion, "extract_pages", fail_extraction)
     source = BytesIO(SAMPLE_PDF.read_bytes())
     upload = UploadFile(
         file=source,

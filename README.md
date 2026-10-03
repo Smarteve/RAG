@@ -104,6 +104,15 @@ separate volumes at `/app/data/documents` and `/app/data/extracted`) to keep bot
 originals and results when replacing the container. Both directories must be
 writable by the container user (UID 10001).
 
+## Code responsibilities
+
+- `main.py` defines the HTTP endpoints, translates application errors into HTTP
+  responses, and closes request-owned uploads.
+- `services/ingestion.py` validates uploads and coordinates PDF storage,
+  extraction, and result storage. It returns an internal `IngestionResult` and
+  raises application errors rather than `HTTPException`.
+- `services/extraction.py` parses PDFs; `storage.py` handles file persistence.
+
 ## Checks and CI
 
 Run the same checks as GitHub Actions locally:
