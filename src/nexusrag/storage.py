@@ -110,4 +110,8 @@ def _remove_temporary_file(path: Path, kind: str) -> None:
         logger.exception("Could not remove temporary %s %s", kind, path)
 
 
-def load_extraction(document_id: UUID, extraction_directory: Path)
+def load_extraction(
+    document_id: UUID, extraction_directory: Path
+) -> DocumentExtraction:
+    """Placeholder for the next storage assignment."""
+    raise NotImplementedError("Loading saved extraction results is not implemented yet")
