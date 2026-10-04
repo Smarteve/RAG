@@ -9,11 +9,17 @@ from fastapi import UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 
-from nexusrag.constants import CHUNK_SIZE_BYTES
+from nexusrag.constants import (
+    CHUNK_SIZE_BYTES,
+    DEFAULT_CHUNK_OVERLAP_CHARS,
+    DEFAULT_CHUNK_SIZE_CHARS,
+)
+from nexusrag.schemas.chunk import DocumentChunks
 from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES, DocumentMetadata
 from nexusrag.schemas.extraction import DocumentExtraction
+from nexusrag.services.chunking import chunk_document
 from nexusrag.services.extraction import DocumentExtractionError, extract_pages
-from nexusrag.storage import save_document, save_extraction
+from nexusrag.storage import save_chunks, save_document, save_extraction
 
 logger = logging.getLogger(__name__)
 PDF_SIGNATURE = b"%PDF-"
@@ -43,20 +49,30 @@ class ExtractionStorageError(Exception):
         self.document_id = document_id
 
 
+class ChunkStorageError(Exception):
+    """Chunk JSON could not be saved, but the PDF and extraction were retained."""
+
+    def __init__(self, document_id: UUID) -> None:
+        super().__init__("Could not save document chunks")
+        self.document_id = document_id
+
+
 @dataclass(frozen=True)
 class IngestionResult:
     """Internal workflow result; the API builds its own response from this."""
 
     metadata: DocumentMetadata
     extraction: DocumentExtraction
+    chunks: DocumentChunks | None
 
 
 async def ingest_document(
     file: UploadFile,
     storage_directory: Path,
     extraction_directory: Path,
+    chunk_directory: Path,
 ) -> IngestionResult:
-    """Validate, store, extract, and persist a result; the caller closes the upload."""
+    """Validate, save, extract, and chunk; the caller owns closing the upload."""
     metadata = await _validate_pdf_upload(file)
 
     try:
@@ -75,7 +91,28 @@ async def ingest_document(
         logger.exception("Failed to save extraction for %s", document_id)
         raise ExtractionStorageError(document_id) from error
 
-    return IngestionResult(metadata=metadata, extraction=extraction)
+    chunks = None
+    if extraction.status == "completed":
+        # Invalid generated chunks indicate a bug and must not be silently skipped.
+        chunks = await run_in_threadpool(_chunk_extraction, extraction)
+        try:
+            await save_chunks(chunks, chunk_directory)
+        except OSError as error:
+            logger.exception("Failed to save chunks for %s", document_id)
+            raise ChunkStorageError(document_id) from error
+
+    return IngestionResult(metadata=metadata, extraction=extraction, chunks=chunks)
+
+
+def _chunk_extraction(extraction: DocumentExtraction) -> DocumentChunks:
+    return DocumentChunks(
+        document_id=extraction.document_id,
+        chunk_size=DEFAULT_CHUNK_SIZE_CHARS,
+        overlap=DEFAULT_CHUNK_OVERLAP_CHARS,
+        chunks=chunk_document(
+            extraction, DEFAULT_CHUNK_SIZE_CHARS, DEFAULT_CHUNK_OVERLAP_CHARS
+        ),
+    )
 
 
 async def _validate_pdf_upload(file: UploadFile) -> DocumentMetadata:

@@ -8,6 +8,7 @@ from fastapi import UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from nexusrag.constants import CHUNK_SIZE_BYTES
+from nexusrag.schemas.chunk import DocumentChunks
 from nexusrag.schemas.extraction import DocumentExtraction
 
 logger = logging.getLogger(__name__)
@@ -77,9 +78,24 @@ async def save_extraction(
 def _save_extraction(
     extraction: DocumentExtraction, extraction_directory: Path
 ) -> Path:
-    destination = extraction_directory / f"{extraction.document_id}.json"
-    json_text = extraction.model_dump_json(indent=2)
-    extraction_directory.mkdir(parents=True, exist_ok=True)
+    return _save_json(extraction, extraction_directory, "extraction")
+
+
+async def save_chunks(record: DocumentChunks, chunk_directory: Path) -> Path:
+    """Atomically publish chunk JSON in a worker thread; propagate storage errors."""
+    return await run_in_threadpool(_save_chunks, record, chunk_directory)
+
+
+def _save_chunks(record: DocumentChunks, chunk_directory: Path) -> Path:
+    return _save_json(record, chunk_directory, "chunks")
+
+
+def _save_json(
+    record: DocumentExtraction | DocumentChunks, directory: Path, kind: str
+) -> Path:
+    destination = directory / f"{record.document_id}.json"
+    json_text = record.model_dump_json(indent=2)
+    directory.mkdir(parents=True, exist_ok=True)
     temporary_path = None
 
     try:
@@ -87,8 +103,8 @@ def _save_extraction(
         with NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=extraction_directory,
-            prefix=f".{extraction.document_id}.",
+            dir=directory,
+            prefix=f".{record.document_id}.",
             suffix=".tmp",
             delete=False,
         ) as output:
@@ -97,7 +113,7 @@ def _save_extraction(
         temporary_path.replace(destination)
     finally:
         if temporary_path is not None:
-            _remove_temporary_file(temporary_path, "extraction")
+            _remove_temporary_file(temporary_path, kind)
 
     return destination
 
@@ -127,3 +143,16 @@ def _load_extraction(
         raise ValueError("Stored extraction document ID does not match requested ID")
 
     return extraction
+
+
+async def load_chunks(document_id: UUID, chunk_directory: Path) -> DocumentChunks:
+    """Load and validate saved chunks in a worker thread without changing storage."""
+    return await run_in_threadpool(_load_chunks, document_id, chunk_directory)
+
+
+def _load_chunks(document_id: UUID, chunk_directory: Path) -> DocumentChunks:
+    source = chunk_directory / f"{document_id}.json"
+    record = DocumentChunks.model_validate_json(source.read_text(encoding="utf-8"))
+    if record.document_id != document_id:
+        raise ValueError("Stored chunks document ID does not match requested ID")
+    return record

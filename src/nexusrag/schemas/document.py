@@ -36,3 +36,4 @@ class UploadDocumentResponse(BaseModel):
     extraction_status: ExtractionStatus
     page_count: int | None = Field(ge=0)
     extraction_error: ExtractionErrorCode | None = None
+    chunk_count: int | None = Field(default=None, ge=0)

@@ -1,11 +1,12 @@
+from nexusrag.constants import DEFAULT_CHUNK_OVERLAP_CHARS, DEFAULT_CHUNK_SIZE_CHARS
 from nexusrag.schemas.chunk import DocumentChunk
 from nexusrag.schemas.extraction import DocumentExtraction
 
 
 def chunk_document(
     extraction: DocumentExtraction,
-    chunk_size: int = 1000,
-    overlap: int = 200,
+    chunk_size: int = DEFAULT_CHUNK_SIZE_CHARS,
+    overlap: int = DEFAULT_CHUNK_OVERLAP_CHARS,
 ) -> list[DocumentChunk]:
     """Split successful extraction pages into overlapping character windows.
 

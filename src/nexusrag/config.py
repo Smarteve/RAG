@@ -14,3 +14,7 @@ EXTRACTION_DIRECTORY = (
     .expanduser()
     .resolve()
 )
+
+CHUNK_DIRECTORY = (
+    Path(os.environ.get("NEXUSRAG_CHUNK_DIR", "data/chunks")).expanduser().resolve()
+)

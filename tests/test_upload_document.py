@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, NameObject
 from starlette.datastructures import Headers
@@ -13,6 +14,7 @@ from starlette.datastructures import Headers
 from nexusrag import config, main, storage
 from nexusrag.constants import CHUNK_SIZE_BYTES
 from nexusrag.main import app
+from nexusrag.schemas.chunk import DocumentChunk
 from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES
 from nexusrag.schemas.extraction import DocumentExtraction
 from nexusrag.services import ingestion
@@ -68,6 +70,7 @@ def test_pdf_upload_returns_document_metadata(
         "extraction_status",
         "page_count",
         "extraction_error",
+        "chunk_count",
     }
     assert set(body["metadata"]) == {
         "filename",
@@ -162,6 +165,7 @@ def test_parse_failure_keeps_pdf_and_persists_failed_status(
     assert body["extraction_status"] == "failed"
     assert body["page_count"] is None
     assert body["extraction_error"] == "pdf_read_failed"
+    assert body["chunk_count"] is None
     assert (storage_directory / f"{document_id}.pdf").read_bytes() == contents
     result = DocumentExtraction.model_validate_json(
         (extraction_directory / f"{document_id}.json").read_text(encoding="utf-8")
@@ -263,14 +267,17 @@ def test_blank_pdf_is_successful_extraction() -> None:
     assert response.status_code == 201
     assert response.json()["extraction_status"] == "completed"
     assert response.json()["page_count"] == 1
+    assert response.json()["chunk_count"] == 0
 
 
-def test_extraction_and_both_storage_helpers_run_outside_event_loop(
+def test_processing_and_storage_helpers_run_outside_event_loop(
     monkeypatch,
 ) -> None:
     original_extract = ingestion.extract_pages
     original_save_document = storage._save_document
     original_save = storage._save_extraction
+    original_chunk = ingestion._chunk_extraction
+    original_save_chunks = storage._save_chunks
     calls = []
 
     def save_pdf_in_worker(source, directory):
@@ -291,16 +298,30 @@ def test_extraction_and_both_storage_helpers_run_outside_event_loop(
         calls.append("save")
         return original_save(extraction, directory)
 
+    def chunk_in_worker(extraction):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        calls.append("chunk")
+        return original_chunk(extraction)
+
+    def save_chunks_in_worker(record, directory):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        calls.append("save_chunks")
+        return original_save_chunks(record, directory)
+
     monkeypatch.setattr(ingestion, "extract_pages", extract_in_worker)
     monkeypatch.setattr(storage, "_save_document", save_pdf_in_worker)
     monkeypatch.setattr(storage, "_save_extraction", save_in_worker)
+    monkeypatch.setattr(ingestion, "_chunk_extraction", chunk_in_worker)
+    monkeypatch.setattr(storage, "_save_chunks", save_chunks_in_worker)
     response = client.post(
         "/documents",
         files={"file": ("sample.pdf", SAMPLE_PDF.read_bytes(), "application/pdf")},
     )
 
     assert response.status_code == 201
-    assert calls == ["pdf", "extract", "save"]
+    assert calls == ["pdf", "extract", "save", "chunk", "save_chunks"]
 
 
 @pytest.mark.parametrize(
@@ -312,6 +333,7 @@ def test_extraction_and_both_storage_helpers_run_outside_event_loop(
         ("invalid_metadata", 422),
         ("pdf_storage_failure", 500),
         ("json_storage_failure", 500),
+        ("chunk_storage_failure", 500),
         ("parse_failure", None),
     ],
 )
@@ -320,6 +342,7 @@ def test_endpoint_closes_upload_on_success_and_handled_failures(
     expected_status: int | None,
     storage_directory: Path,
     extraction_directory: Path,
+    chunk_directory: Path,
 ) -> None:
     filename = "sample.pdf"
     media_type = "application/pdf"
@@ -334,6 +357,8 @@ def test_endpoint_closes_upload_on_success_and_handled_failures(
         storage_directory.write_bytes(b"not a directory")
     elif case == "json_storage_failure":
         extraction_directory.write_bytes(b"not a directory")
+    elif case == "chunk_storage_failure":
+        chunk_directory.write_bytes(b"not a directory")
     elif case == "parse_failure":
         contents = b"%PDF-1.4\nbroken\n"
 
@@ -379,3 +404,37 @@ def test_endpoint_closes_upload_when_unexpected_error_propagates(monkeypatch) ->
 
     assert exc.value is error
     assert source.closed
+
+
+def test_internal_chunk_validation_failure_propagates_and_closes_upload(
+    monkeypatch: pytest.MonkeyPatch, extraction_directory: Path, chunk_directory: Path
+) -> None:
+    with pytest.raises(ValidationError) as invalid:
+        DocumentChunk(
+            document_id=UUID(int=1),
+            page_number=1,
+            chunk_index=0,
+            start_char=0,
+            end_char=5,
+            text="wrong length",
+        )
+    error = invalid.value
+
+    def fail_chunk(extraction):
+        raise error
+
+    monkeypatch.setattr(ingestion, "_chunk_extraction", fail_chunk)
+    source = BytesIO(SAMPLE_PDF.read_bytes())
+    upload = UploadFile(
+        file=source,
+        filename="sample.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+
+    with pytest.raises(ValidationError) as propagated:
+        asyncio.run(main.upload_document(upload))
+
+    assert propagated.value is error
+    assert source.closed
+    assert len(list(extraction_directory.iterdir())) == 1
+    assert not chunk_directory.exists()
