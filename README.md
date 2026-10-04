@@ -86,9 +86,26 @@ a parsing error; OCR is not implemented.
 
 If JSON storage fails, the API returns `500` with the saved `document_id` in
 `detail`, and retains the PDF. No extraction record is guaranteed in that case.
-There is no automatic retry, retrieval endpoint, or database yet. Upload metadata
+There is no automatic retry, search endpoint, or database yet. Upload metadata
 is returned but not persisted. A process crash between PDF and JSON storage can
 also leave a PDF without a result; these are not a single transactional write.
+
+To read an extracted page, use
+`GET /documents/{document_id}/pages/{page_number}` with the ID returned by upload.
+Page numbers start at 1. A successful response is `200 OK` with this shape:
+
+```json
+{
+  "document_id": "00000000-0000-4000-8000-000000000001",
+  "page": {"page_number": 1, "text": "Extracted page text..."}
+}
+```
+
+Blank pages return an empty text string. Invalid UUIDs or page numbers return
+`422`; unknown documents or missing pages return `404`. Failed extraction or a
+saved PDF without an extraction result returns `409`. Corrupt saved JSON, a
+mismatched document ID, or a storage error returns `500` with a generic message.
+This endpoint returns one whole page; page-list pagination is a later step.
 
 To choose other directories, set the environment variables before starting:
 

@@ -1,10 +1,19 @@
+import logging
+from typing import Annotated
+from uuid import UUID
+
 from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import Path as PathParameter
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from nexusrag import config
 from nexusrag.schemas.document import UploadDocumentResponse
+from nexusrag.schemas.extraction import FetchPageResponse
 from nexusrag.services import ingestion
+from nexusrag.storage import load_extraction
 
+logger = logging.getLogger(__name__)
 app = FastAPI(title="NexusRAG")
 
 
@@ -53,3 +62,47 @@ async def upload_document(file: UploadFile) -> UploadDocumentResponse:
         ) from error
     finally:
         await file.close()
+
+
+@app.get(
+    "/documents/{document_id}/pages/{page_number}",
+    response_model=FetchPageResponse,
+)
+async def fetch_page(
+    document_id: UUID,
+    page_number: Annotated[int, PathParameter(ge=1)],
+) -> FetchPageResponse:
+    """Read one saved page using its original, one-based PDF page number."""
+    try:
+        document = await load_extraction(document_id, config.EXTRACTION_DIRECTORY)
+    except FileNotFoundError as error:
+        # A PDF may have been saved before JSON storage failed or was interrupted.
+        # Check in a worker thread because even a filesystem stat is synchronous.
+        pdf_path = config.STORAGE_DIRECTORY / f"{document_id}.pdf"
+        try:
+            pdf_exists = await run_in_threadpool(pdf_path.is_file)
+        except OSError as storage_error:
+            logger.exception("Could not check stored document %s", document_id)
+            raise HTTPException(
+                500, detail="Could not load document"
+            ) from storage_error
+        if pdf_exists:
+            raise HTTPException(
+                409, detail="Document extraction result is not available"
+            ) from error
+        raise HTTPException(404, detail="Document not found") from error
+    except (ValueError, OSError) as error:
+        # ValidationError and UnicodeDecodeError are ValueError subclasses.
+        # Corrupt stored data is a server error; don't expose internal details.
+        logger.exception("Could not load extraction for %s", document_id)
+        raise HTTPException(500, detail="Could not load document") from error
+
+    if document.status == "failed":
+        raise HTTPException(409, detail="Document extraction failed")
+
+    # Use the stored page number rather than assuming list order matches it.
+    for page in document.pages:
+        if page.page_number == page_number:
+            return FetchPageResponse(document_id=document_id, page=page)
+
+    raise HTTPException(404, detail="Requested page does not exist")

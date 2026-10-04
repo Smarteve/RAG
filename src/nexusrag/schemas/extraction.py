@@ -17,3 +17,8 @@ class DocumentExtraction(BaseModel):
     pages: list[ExtractedPage]
     status: ExtractionStatus = "completed"
     error: ExtractionErrorCode | None = None
+
+
+class FetchPageResponse(BaseModel):
+    document_id: UUID
+    page: ExtractedPage
