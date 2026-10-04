@@ -11,7 +11,8 @@ from nexusrag import config
 from nexusrag.schemas.chunk import FetchChunksResponse
 from nexusrag.schemas.document import UploadDocumentResponse
 from nexusrag.schemas.extraction import FetchPageResponse
-from nexusrag.services import ingestion
+from nexusrag.schemas.retrieval import SearchResponse
+from nexusrag.services import ingestion, retrieval
 from nexusrag.storage import load_chunks, load_extraction
 
 logger = logging.getLogger(__name__)
@@ -147,3 +148,49 @@ async def fetch_chunks(
         limit=limit,
         chunks=record.chunks[offset : offset + limit],
     )
+
+
+@app.get("/documents/{document_id}/search", response_model=SearchResponse)
+async def search_document(
+    document_id: UUID,
+    query: Annotated[str, Query(min_length=1, max_length=500)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 5,
+) -> SearchResponse:
+    """Rank saved chunks by matching query words, returning text and page references."""
+    # Validate before checking storage so a bad query consistently returns 422.
+    # Catch only the explicit input error: ValidationError is also a ValueError,
+    # but an invalid internally generated hit must not be treated as client input.
+    try:
+        retrieval.validate_query(query)
+    except retrieval.InvalidSearchQueryError as error:
+        raise HTTPException(422, detail=str(error)) from error
+
+    try:
+        record = await load_chunks(document_id, config.CHUNK_DIRECTORY)
+    except FileNotFoundError as error:
+        pdf_path = config.STORAGE_DIRECTORY / f"{document_id}.pdf"
+        try:
+            pdf_exists = await run_in_threadpool(pdf_path.is_file)
+        except OSError as storage_error:
+            logger.exception("Could not check stored document %s", document_id)
+            raise HTTPException(500, detail="Could not load chunks") from storage_error
+        if pdf_exists:
+            raise HTTPException(
+                409, detail="Document chunks are not available"
+            ) from error
+        raise HTTPException(404, detail="Document not found") from error
+    except (ValueError, OSError) as error:
+        logger.exception("Could not load chunks for search of %s", document_id)
+        raise HTTPException(500, detail="Could not load chunks") from error
+
+    try:
+        hits = await run_in_threadpool(
+            retrieval.search_chunks, record.chunks, query, limit
+        )
+    except Exception as error:
+        # This HTTP boundary logs internal failures; the pure ranking function
+        # continues to propagate them instead of hiding or skipping invalid hits.
+        logger.exception("Could not search document %s", document_id)
+        raise HTTPException(500, detail="Could not search document") from error
+
+    return SearchResponse(document_id=document_id, query=query, hits=hits)

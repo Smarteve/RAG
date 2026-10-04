@@ -34,9 +34,9 @@ The planned flow is:
 5. Generate an answer with citations to the supporting pages.
 
 The project currently has upload validation, local PDF storage, page-by-page text
-extraction, overlapping chunks with JSON storage and paginated fetching, tests,
-Docker, and CI configuration. Retrieval and
-AI answers are still to be implemented. The first RAG milestone is answering a
+extraction, overlapping chunks with JSON storage and paginated fetching,
+single-document keyword search, tests, Docker, and CI configuration. Semantic
+retrieval and AI answers are still to be implemented. The first RAG milestone is answering a
 question about one text-based PDF with a supporting page citation.
 
 ## Run locally
@@ -101,7 +101,7 @@ If JSON storage fails, the API returns `500` with the saved `document_id` in
 JSON storage fails. If chunk JSON storage fails, the PDF and extraction JSON
 are retained. Internally generated chunk-validation failures are programming
 errors, not client validation failures; they are not silently skipped.
-There is no automatic retry, search endpoint, or database yet. Upload metadata
+There is no automatic retry or database yet. Upload metadata
 is returned but not persisted. A process crash between PDF and JSON storage can
 also leave a PDF without a result; the three files are not a single transactional write.
 
@@ -158,6 +158,59 @@ Pagination bounds returned chunk count, not storage work: this first version
 reads and validates the entire JSON file before slicing. This endpoint fetches
 chunks in document order; it does not search or rank them.
 
+### Search a document
+
+Upload a text-based PDF, copy its document ID, and use the search operation in
+`/docs`, or request:
+
+```text
+GET /documents/{document_id}/search?query=annual%20leave&limit=5
+```
+
+The query is required, must be 1–500 characters, and must contain a searchable
+word. `limit` defaults to 5 and accepts 1–20. An illustrative response is:
+
+```json
+{
+  "document_id": "00000000-0000-4000-8000-000000000001",
+  "query": "annual leave",
+  "hits": [
+    {
+      "chunk": {
+        "document_id": "00000000-0000-4000-8000-000000000001",
+        "page_number": 1,
+        "chunk_index": 0,
+        "start_char": 0,
+        "end_char": 12,
+        "text": "Annual leave"
+      },
+      "score": 2
+    }
+  ]
+}
+```
+
+This is a deterministic keyword baseline, not semantic search or an AI answer.
+Queries and chunk text are case-normalized and split into words; each score is
+the number of distinct query words present in that chunk, not a probability.
+Repeated words do not increase the score. Zero-score chunks are omitted; higher
+scores come first, with lower chunk indices breaking ties. Heap selection returns
+the highest-ranked hits. Synonyms, stemming, stop-word filtering, and
+language-specific tokenization are not implemented; overlapping chunks can both
+appear in the results.
+
+A valid query without matches returns `200` with `hits: []`, including for a
+successfully processed blank document. Invalid UUIDs, queries, or limits return
+`422`; unknown documents return `404`; saved PDFs without chunks return `409`.
+Corrupt storage and internal ranking errors are logged and return generic `500`
+responses without exposing internal details. Invalid queries are checked before
+storage access so they are consistently reported as input errors.
+
+Loading and ranking run in worker threads. Search still reads the full chunk
+record and scores every chunk; `limit` bounds returned hits, not processing work.
+It searches only the requested document. Try `annual leave` against the included
+sample handbook to retrieve supporting passages with page references.
+
 To choose other directories, set the environment variables before starting:
 
 ```bash
@@ -184,6 +237,8 @@ writable by the container user (UID 10001).
 - `services/extraction.py` parses PDFs; `storage.py` handles file persistence.
 - `services/chunking.py` splits extracted pages into traceable character windows
   without HTTP or filesystem operations.
+- `services/retrieval.py` tokenizes queries/text and ranks chunks with a pure
+  keyword-matching function; the HTTP endpoint handles loading and error codes.
 
 ## Checks and CI
 
