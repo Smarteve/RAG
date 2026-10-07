@@ -12,6 +12,13 @@ class SearchHit(BaseModel):
     score: int = Field(gt=0)
 
 
+class SemanticSearchHit(BaseModel):
+    """A chunk and its cosine similarity, not a probability or keyword count."""
+
+    chunk: DocumentChunk
+    similarity: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+
+
 class SearchResponse(BaseModel):
     document_id: UUID
     query: str
