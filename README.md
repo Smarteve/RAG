@@ -268,8 +268,21 @@ embedding library or download a model. The demo now uses `MiniEmbedder`, which
 wraps the already-loaded model and its configured identity. `embed_chunks()`
 encodes validated chunk records in batches of eight and returns a
 `DocumentEmbeddings` record with model identity, dimensions, source digest, and
-aligned chunk vectors. It does not load models or write files. Saved vector
-storage and a semantic API endpoint are not implemented yet.
+aligned chunk vectors. It does not load models or write files.
+
+`storage.save_embeddings()` and `storage.load_embeddings()` save/load
+`data/embeddings/<document_id>.json` using the same atomic JSON publication and
+worker-thread pattern as chunk storage. Override the directory with
+`NEXUSRAG_EMBEDDING_DIR`; storage functions still receive the directory explicitly.
+Loading validates the schema and document ID. The future retrieval service must
+also check model compatibility and the source digest against current chunks.
+Failed writes preserve any previous complete record; no database is required.
+The Dockerfile prepares this directory for the non-root app user, but does not
+install the optional embedding dependencies or load a model.
+
+Upload and keyword search are unchanged: they do not build or save embeddings
+automatically. A semantic-index build action and semantic search endpoint are
+not implemented yet.
 
 ## Code responsibilities
 

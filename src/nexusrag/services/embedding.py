@@ -20,7 +20,9 @@ def embed_chunks(chunks: DocumentChunks, embedder: MiniEmbedder) -> DocumentEmbe
         batch = chunks.chunks[start : start + DEFAULT_EMBEDDING_BATCH_SIZE]
         vectors = embedder.embed_documents([chunk.text for chunk in batch])
         for chunk, vector in zip(batch, vectors, strict=True):
-            embeddings.append(ChunkEmbedding(chunk_index=chunk.index, vector=vector))
+            embeddings.append(
+                ChunkEmbedding(chunk_index=chunk.chunk_index, vector=vector)
+            )
 
     return DocumentEmbeddings(
         document_id=chunks.document_id,

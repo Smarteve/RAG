@@ -9,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from nexusrag.constants import CHUNK_SIZE_BYTES
 from nexusrag.schemas.chunk import DocumentChunks
+from nexusrag.schemas.embedding import DocumentEmbeddings
 from nexusrag.schemas.extraction import DocumentExtraction
 
 logger = logging.getLogger(__name__)
@@ -90,8 +91,25 @@ def _save_chunks(record: DocumentChunks, chunk_directory: Path) -> Path:
     return _save_json(record, chunk_directory, "chunks")
 
 
+async def save_embeddings(
+    record: DocumentEmbeddings, embedding_directory: Path
+) -> Path:
+    """Publish complete vector JSON in a worker thread; propagate storage errors.
+
+    A failed write leaves any prior record intact. This does not modify source
+    PDFs, extracted pages, or chunks, and does not load an embedding model.
+    """
+    return await run_in_threadpool(_save_embeddings, record, embedding_directory)
+
+
+def _save_embeddings(record: DocumentEmbeddings, embedding_directory: Path) -> Path:
+    return _save_json(record, embedding_directory, "embeddings")
+
+
 def _save_json(
-    record: DocumentExtraction | DocumentChunks, directory: Path, kind: str
+    record: DocumentExtraction | DocumentChunks | DocumentEmbeddings,
+    directory: Path,
+    kind: str,
 ) -> Path:
     destination = directory / f"{record.document_id}.json"
     json_text = record.model_dump_json(indent=2)
@@ -155,4 +173,25 @@ def _load_chunks(document_id: UUID, chunk_directory: Path) -> DocumentChunks:
     record = DocumentChunks.model_validate_json(source.read_text(encoding="utf-8"))
     if record.document_id != document_id:
         raise ValueError("Stored chunks document ID does not match requested ID")
+    return record
+
+
+async def load_embeddings(
+    document_id: UUID, embedding_directory: Path
+) -> DocumentEmbeddings:
+    """Load and validate vector JSON and its document ID in a worker thread.
+
+    Missing files, filesystem errors, corrupt records, and ID mismatches
+    propagate. Model compatibility and source freshness belong to the caller.
+    """
+    return await run_in_threadpool(_load_embeddings, document_id, embedding_directory)
+
+
+def _load_embeddings(
+    document_id: UUID, embedding_directory: Path
+) -> DocumentEmbeddings:
+    source = embedding_directory / f"{document_id}.json"
+    record = DocumentEmbeddings.model_validate_json(source.read_text(encoding="utf-8"))
+    if record.document_id != document_id:
+        raise ValueError("Stored embeddings document ID does not match requested ID")
     return record
