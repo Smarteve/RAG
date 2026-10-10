@@ -227,6 +227,50 @@ separate volumes at `/app/data/documents`, `/app/data/extracted`, and
 All three directories must be
 writable by the container user (UID 10001).
 
+## Try local MiniLM embeddings
+
+Embeddings are an optional extra; the current API, Docker image, and normal CI
+still use keyword search and do not load a model. Install the extra locally:
+
+```bash
+uv sync --locked --extra embeddings --dev
+uv run --no-sync python examples/minilm_smoke.py
+```
+
+The script loads `sentence-transformers/all-MiniLM-L6-v2` on CPU at a pinned
+model commit, encodes a vacation query and two passages, and compares their
+vectors with our cosine similarity helper. It prints dimensions, token counts,
+and two scores. Change the sentences to experiment; scores are not probabilities
+and an unrelated query still receives a similarity score.
+
+The first run downloads public model files from Hugging Face into ignored
+`data/models/`. Text encoding runs locally, not through a hosted inference API.
+Dependencies also require downloads and additional disk/RAM beyond model weights.
+Linux/Windows use PyTorch's explicit CPU wheel index to avoid CUDA dependencies;
+macOS uses the normal PyPI build. See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/).
+
+MiniLM outputs 384 values per vector and has a default 256-token input limit.
+The demo checks the tokenizer's count, including special tokens, and rejects
+oversized inputs before encoding instead of accepting silent truncation. Our
+1000-character chunk size does not guarantee that every chunk fits. MiniLM does
+not need BGE/E5 query prefixes. See the [model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
+
+After the first successful download, you can check that the model works offline:
+
+```bash
+HF_HUB_OFFLINE=1 uv run --no-sync python examples/minilm_smoke.py
+```
+
+Run the demo with `--no-sync` after installing the extra: a plain `uv sync` or
+`uv run` without `--extra embeddings` may remove the optional packages. Normal
+tests only exercise the token-budget helper with fakes; they do not import the
+embedding library or download a model. The demo now uses `MiniEmbedder`, which
+wraps the already-loaded model and its configured identity. `embed_chunks()`
+encodes validated chunk records in batches of eight and returns a
+`DocumentEmbeddings` record with model identity, dimensions, source digest, and
+aligned chunk vectors. It does not load models or write files. Saved vector
+storage and a semantic API endpoint are not implemented yet.
+
 ## Code responsibilities
 
 - `main.py` defines the HTTP endpoints, translates application errors into HTTP
