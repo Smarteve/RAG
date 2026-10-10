@@ -1,8 +1,11 @@
 import re
-from heapq import nsmallest
+from hashlib import sha256
+from heapq import nlargest, nsmallest
 
-from nexusrag.schemas.chunk import DocumentChunk
-from nexusrag.schemas.retrieval import SearchHit
+from nexusrag.schemas.chunk import DocumentChunk, DocumentChunks
+from nexusrag.schemas.embedding import DocumentEmbeddings
+from nexusrag.schemas.retrieval import SearchHit, SemanticSearchHit
+from nexusrag.services.similarity import cosine_similarity
 
 _WORD_PATTERN = re.compile(r"[^\W_]+")
 
@@ -52,3 +55,45 @@ def search_chunks(
             hits.append(SearchHit(chunk=chunk, score=score))
 
     return nsmallest(limit, hits, key=lambda hit: (-hit.score, hit.chunk.chunk_index))
+
+
+def search_semantic_chunks(
+    chunks: DocumentChunks,
+    embeddings: DocumentEmbeddings,
+    query_vector: list[float],
+    limit: int = 5,
+) -> list[SemanticSearchHit]:
+    """Rank aligned chunk vectors by cosine similarity, then chunk index.
+
+    Chunks supply the original text and page references; embeddings supply the
+    vectors used for scoring. Reject mismatched or stale records with ValueError.
+    Validate inputs even for an empty document, and keep zero/negative scores.
+    The caller must ensure the query uses the same model and revision as the
+    stored embeddings: a bare query vector carries no model identity.
+    """
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    # Reuse the mathematical validation, even when there are no chunks to score.
+    cosine_similarity(query_vector, query_vector)
+    if len(query_vector) != embeddings.dimensions:
+        raise ValueError("query vector length must match embedding dimensions")
+    if chunks.document_id != embeddings.document_id:
+        raise ValueError("chunks and embeddings must belong to the same document")
+    if len(chunks.chunks) != len(embeddings.embeddings):
+        raise ValueError("every chunk must have exactly one embedding")
+    source_digest = sha256(chunks.model_dump_json().encode("utf-8")).hexdigest()
+    if source_digest != embeddings.source_digest:
+        raise ValueError("embeddings are stale: source digest does not match chunks")
+
+    semantic_hits: list[SemanticSearchHit] = []
+
+    for chunk, embedding in zip(chunks.chunks, embeddings.embeddings, strict=True):
+        if chunk.chunk_index != embedding.chunk_index:
+            raise ValueError("chunk and embedding indices must match")
+        similarity = cosine_similarity(query_vector, embedding.vector)
+        semantic_hits.append(SemanticSearchHit(chunk=chunk, similarity=similarity))
+
+    return nlargest(
+        limit, semantic_hits, key=lambda hit: (hit.similarity, -hit.chunk.chunk_index)
+    )
