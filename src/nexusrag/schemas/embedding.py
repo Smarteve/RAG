@@ -42,3 +42,13 @@ class DocumentEmbeddings(BaseModel):
                 raise ValueError("Chunk indices must be sequential starting at zero")
 
         return self
+
+
+class SemanticIndexResponse(BaseModel):
+    """Compact metadata for a successfully created or rebuilt semantic index."""
+
+    document_id: UUID
+    model_id: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    dimensions: int = Field(gt=0)
+    embedding_count: int = Field(ge=0)

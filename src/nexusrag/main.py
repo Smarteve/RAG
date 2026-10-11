@@ -2,18 +2,25 @@ import logging
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
 from fastapi import Path as PathParameter
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from nexusrag import config
+from nexusrag.dependencies import get_embedding_runtime
 from nexusrag.schemas.chunk import FetchChunksResponse
 from nexusrag.schemas.document import UploadDocumentResponse
+from nexusrag.schemas.embedding import SemanticIndexResponse
 from nexusrag.schemas.extraction import FetchPageResponse
-from nexusrag.schemas.retrieval import SearchResponse
-from nexusrag.services import ingestion, retrieval
-from nexusrag.storage import load_chunks, load_extraction
+from nexusrag.schemas.retrieval import SearchResponse, SemanticSearchResponse
+from nexusrag.services import indexing, ingestion, retrieval
+from nexusrag.services.embedding_model import EmbeddingInputError
+from nexusrag.services.embedding_runtime import (
+    EmbeddingModelUnavailableError,
+    EmbeddingRuntime,
+)
+from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="NexusRAG")
@@ -194,3 +201,162 @@ async def search_document(
         raise HTTPException(500, detail="Could not search document") from error
 
     return SearchResponse(document_id=document_id, query=query, hits=hits)
+
+
+@app.post(
+    "/documents/{document_id}/semantic-index",
+    response_model=SemanticIndexResponse,
+    status_code=200,
+)
+async def build_document_semantic_index(
+    document_id: UUID,
+    runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
+) -> SemanticIndexResponse:
+    """Create or rebuild saved embeddings without returning vectors or paths."""
+    # Validate source availability before loading an expensive optional model.
+    # The service rereads chunks after acquiring the model lock, so a queued
+    # rebuild uses the current snapshot rather than this preflight snapshot.
+    try:
+        await load_chunks(document_id, config.CHUNK_DIRECTORY)
+    except FileNotFoundError as error:
+        pdf_path = config.STORAGE_DIRECTORY / f"{document_id}.pdf"
+        try:
+            pdf_exists = await run_in_threadpool(pdf_path.is_file)
+        except OSError as storage_error:
+            logger.exception("Could not check stored document %s", document_id)
+            raise HTTPException(500, detail="Could not load chunks") from storage_error
+        if pdf_exists:
+            raise HTTPException(
+                409, detail="Document chunks are not available"
+            ) from error
+        raise HTTPException(404, detail="Document not found") from error
+    except (ValueError, OSError) as error:
+        logger.exception("Could not load chunks for indexing of %s", document_id)
+        raise HTTPException(500, detail="Could not load chunks") from error
+
+    try:
+        async with runtime.use_embedder() as embedder:
+            record = await indexing.build_semantic_index(
+                document_id,
+                embedder,
+                config.CHUNK_DIRECTORY,
+                config.EMBEDDING_DIRECTORY,
+            )
+            return SemanticIndexResponse(
+                document_id=record.document_id,
+                model_id=record.model_id,
+                model_revision=record.model_revision,
+                dimensions=record.dimensions,
+                embedding_count=len(record.embeddings),
+            )
+    except EmbeddingModelUnavailableError as error:
+        logger.exception("Could not load embedding model for %s", document_id)
+        raise HTTPException(
+            503,
+            detail="Local embedding model unavailable; install the embeddings extra "
+            "and cache the configured model before indexing",
+        ) from error
+    except EmbeddingInputError as error:
+        raise HTTPException(
+            409,
+            detail="Document chunks contain blank or oversized text; "
+            "rechunk before indexing",
+        ) from error
+    except Exception as error:
+        # Internal schema/model bugs and filesystem failures are not user input.
+        logger.exception("Could not build semantic index for %s", document_id)
+        raise HTTPException(500, detail="Could not build semantic index") from error
+
+
+@app.get(
+    "/documents/{document_id}/semantic-search",
+    response_model=SemanticSearchResponse,
+)
+async def semantic_search_document(
+    document_id: UUID,
+    query: Annotated[str, Query(min_length=1, max_length=500)],
+    runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 5,
+) -> SemanticSearchResponse:
+    """Embed only the query and rank an existing, compatible document index."""
+    # Semantic inputs need not follow the keyword tokenizer's word rules.
+    if not query.strip():
+        raise HTTPException(422, detail="query must not be blank")
+
+    try:
+        chunk_record = await load_chunks(document_id, config.CHUNK_DIRECTORY)
+    except FileNotFoundError as error:
+        pdf_path = config.STORAGE_DIRECTORY / f"{document_id}.pdf"
+        try:
+            pdf_exists = await run_in_threadpool(pdf_path.is_file)
+        except OSError as storage_error:
+            logger.exception("Could not check stored document %s", document_id)
+            raise HTTPException(500, detail="Could not load chunks") from storage_error
+        if pdf_exists:
+            raise HTTPException(
+                409, detail="Document chunks are not available"
+            ) from error
+        raise HTTPException(404, detail="Document not found") from error
+    except (ValueError, OSError) as error:
+        logger.exception("Could not load chunks for semantic search of %s", document_id)
+        raise HTTPException(500, detail="Could not load chunks") from error
+
+    # Chunks establish that the document exists. A missing index is a separate
+    # state conflict, not an unknown document or a reason to embed it in a GET.
+    try:
+        embedding_record = await load_embeddings(
+            document_id, config.EMBEDDING_DIRECTORY
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(
+            409, detail="Semantic index is not available; build it before searching"
+        ) from error
+    except (ValueError, OSError) as error:
+        logger.exception("Could not load semantic index for %s", document_id)
+        raise HTTPException(500, detail="Could not load semantic index") from error
+
+    try:
+        await run_in_threadpool(
+            retrieval.validate_semantic_index, chunk_record, embedding_record
+        )
+        # Reject a known old model/revision without loading the optional model.
+        if (
+            embedding_record.model_id != config.EMBEDDING_MODEL_ID
+            or embedding_record.model_revision != config.EMBEDDING_MODEL_REVISION
+        ):
+            raise retrieval.StaleSemanticIndexError("configured model does not match")
+
+        async with runtime.use_embedder() as embedder:
+            dimensions = await run_in_threadpool(embedder.get_dimensions)
+            if (
+                embedding_record.model_id != embedder.model_id
+                or embedding_record.model_revision != embedder.model_revision
+                or embedding_record.dimensions != dimensions
+            ):
+                raise retrieval.StaleSemanticIndexError("loaded model does not match")
+            query_vector = await run_in_threadpool(embedder.embed_query, query)
+            hits = await run_in_threadpool(
+                retrieval.search_semantic_chunks,
+                chunk_record,
+                embedding_record,
+                query_vector,
+                limit,
+            )
+        return SemanticSearchResponse(document_id=document_id, query=query, hits=hits)
+    except retrieval.StaleSemanticIndexError as error:
+        raise HTTPException(
+            409, detail="Semantic index is stale or incompatible; rebuild it"
+        ) from error
+    except EmbeddingInputError as error:
+        raise HTTPException(422, detail=str(error)) from error
+    except EmbeddingModelUnavailableError as error:
+        logger.exception("Could not load embedding model for search of %s", document_id)
+        raise HTTPException(
+            503,
+            detail="Local embedding model unavailable; install the embeddings extra "
+            "and cache the configured model before searching",
+        ) from error
+    except Exception as error:
+        # Provider/schema failures are internal errors, not bad user input.
+        logger.exception("Could not semantically search document %s", document_id)
+        raise HTTPException(500, detail="Could not search document") from error

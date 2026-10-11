@@ -35,8 +35,9 @@ The planned flow is:
 
 The project currently has upload validation, local PDF storage, page-by-page text
 extraction, overlapping chunks with JSON storage and paginated fetching,
-single-document keyword search, tests, Docker, and CI configuration. Semantic
-retrieval and AI answers are still to be implemented. The first RAG milestone is answering a
+single-document keyword and semantic search, explicit semantic-index building,
+tests, Docker, and CI configuration. AI-generated answers are not implemented.
+The first RAG milestone is answering a
 question about one text-based PDF with a supporting page citation.
 
 ## Run locally
@@ -229,8 +230,9 @@ writable by the container user (UID 10001).
 
 ## Try local MiniLM embeddings
 
-Embeddings are an optional extra; the current API, Docker image, and normal CI
-still use keyword search and do not load a model. Install the extra locally:
+Embeddings are an optional extra. Ordinary API startup, uploads, keyword search,
+and normal CI do not load a model. The Docker image does not install the extra.
+Install it locally and explicitly download/cache the model using the demo:
 
 ```bash
 uv sync --locked --extra embeddings --dev
@@ -243,8 +245,11 @@ vectors with our cosine similarity helper. It prints dimensions, token counts,
 and two scores. Change the sentences to experiment; scores are not probabilities
 and an unrelated query still receives a similarity score.
 
-The first run downloads public model files from Hugging Face into ignored
-`data/models/`. Text encoding runs locally, not through a hosted inference API.
+The first demo run downloads public model files from Hugging Face into ignored
+`data/models/`. Override that location with `NEXUSRAG_MODEL_CACHE_DIR`, set before
+running the demo or server. Relative paths resolve from the working directory;
+run both commands from the project root to use the same default cache.
+Text encoding runs locally, not through a hosted inference API.
 Dependencies also require downloads and additional disk/RAM beyond model weights.
 Linux/Windows use PyTorch's explicit CPU wheel index to avoid CUDA dependencies;
 macOS uses the normal PyPI build. See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/).
@@ -274,15 +279,78 @@ aligned chunk vectors. It does not load models or write files.
 `data/embeddings/<document_id>.json` using the same atomic JSON publication and
 worker-thread pattern as chunk storage. Override the directory with
 `NEXUSRAG_EMBEDDING_DIR`; storage functions still receive the directory explicitly.
-Loading validates the schema and document ID. The future retrieval service must
+Loading validates the schema and document ID. The semantic retrieval caller must
 also check model compatibility and the source digest against current chunks.
 Failed writes preserve any previous complete record; no database is required.
 The Dockerfile prepares this directory for the non-root app user, but does not
 install the optional embedding dependencies or load a model.
 
-Upload and keyword search are unchanged: they do not build or save embeddings
-automatically. A semantic-index build action and semantic search endpoint are
-not implemented yet.
+### Build a document's semantic index
+
+After installing the extra and running the demo, start the server without
+removing the optional packages:
+
+```bash
+uv run --no-sync uvicorn nexusrag.main:app --reload
+```
+
+Upload a PDF, copy its document ID, and use this operation in `/docs`:
+
+```text
+POST /documents/{document_id}/semantic-index
+```
+
+No request body or page number is needed. The operation waits for completion,
+saves `data/embeddings/<document_id>.json`, and returns `200 OK` with only
+`document_id`, `model_id`, `model_revision`, `dimensions`, and `embedding_count`.
+It can create or rebuild an index; vectors, paths, and document text are not
+included in the response. Blank documents produce an empty index with count zero.
+
+The API loads the pinned CPU model lazily from the local cache only, using
+[`local_files_only=True`](https://www.sbert.net/docs/package_reference/sentence_transformer/model.html).
+Requests do not initiate model downloads. One model is reused per application
+process, with loading and inference offloaded and serialized. Multiple server
+processes each have their own model and lock; there is no background queue yet.
+
+Invalid UUIDs return `422`, unknown documents `404`, and PDFs without available
+chunks `409`. Blank or over-token-budget chunk text also returns `409`; adjust
+chunking rather than silently truncating. Unavailable optional packages or cached
+model files return a safe `503`. Corrupt records, invalid model output, or storage
+failures return a generic `500` with internal details logged.
+
+Rebuild failures retain the source PDF/chunks and any previous complete index.
+Atomic replacement protects this one JSON file, not a transaction across source
+and index files; search must verify the stored source digest against current chunks.
+Upload and keyword search remain unchanged and do not build embeddings
+automatically.
+
+### Search using embeddings
+
+Build the index first, then use this operation in `/docs`:
+
+```text
+GET /documents/{document_id}/semantic-search?query=vacation%20rollover%20rules&limit=5
+```
+
+The query is required, must be nonblank and 1–500 characters, and must fit the
+model's token budget. `limit` defaults to 5 and accepts 1–20. The endpoint loads
+the saved chunks and embeddings, encodes only the query in a worker thread, and
+returns `document_id`, the original `query`, and `hits`. Each hit contains the
+original `chunk` (text, page number, index, and offsets) plus a finite float
+`similarity` between -1 and 1. No vectors or filesystem paths are returned.
+
+Higher similarities rank first, with earlier chunk indices breaking ties.
+Zero and negative similarities are retained: these are nearest passages, not
+guaranteed answers. Empty documents return `hits: []`; unrelated questions can
+still return hits. Keyword `/search` remains a separate baseline.
+
+The index must match the current chunk digest, count/index alignment, configured
+model ID/revision, and loaded model dimensions. A missing, stale, or incompatible
+index returns `409` and must be built/rebuilt explicitly with the POST operation;
+search never rebuilds it. Unknown documents return `404`, bad request input or
+over-budget queries `422`, an unavailable model `503`, and corrupt storage or
+internal failures a safe `500`. Model loading and query inference use the same
+serialized runtime as index building. Searches do not change saved records.
 
 ## Code responsibilities
 
@@ -294,8 +362,9 @@ not implemented yet.
 - `services/extraction.py` parses PDFs; `storage.py` handles file persistence.
 - `services/chunking.py` splits extracted pages into traceable character windows
   without HTTP or filesystem operations.
-- `services/retrieval.py` tokenizes queries/text and ranks chunks with a pure
-  keyword-matching function; the HTTP endpoint handles loading and error codes.
+- `services/retrieval.py` ranks chunks with pure keyword or cosine-similarity
+  functions and checks semantic source alignment. HTTP endpoints handle loading,
+  query encoding, model compatibility, and error codes.
 
 ## Checks and CI
 

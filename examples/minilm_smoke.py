@@ -1,15 +1,18 @@
 """A manual, local embedding experiment; never run or download models in CI."""
 
-from pathlib import Path
 from typing import Protocol
 
-from nexusrag.config import EMBEDDING_MODEL_ID, EMBEDDING_MODEL_REVISION
+from nexusrag.config import (
+    EMBEDDING_MODEL_CACHE_DIRECTORY,
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_REVISION,
+)
 from nexusrag.services.embedding_model import MiniEmbedder
 from nexusrag.services.similarity import cosine_similarity
 
 MODEL_ID = EMBEDDING_MODEL_ID
 MODEL_REVISION = EMBEDDING_MODEL_REVISION
-MODEL_CACHE = Path(__file__).resolve().parents[1] / "data" / "models"
+MODEL_CACHE = EMBEDDING_MODEL_CACHE_DIRECTORY
 
 
 class Tokenizer(Protocol):

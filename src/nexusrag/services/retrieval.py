@@ -14,6 +14,28 @@ class InvalidSearchQueryError(ValueError):
     """The user query contains no searchable words, not an internal model error."""
 
 
+class StaleSemanticIndexError(ValueError):
+    """The saved semantic index needs rebuilding for current chunks/model."""
+
+
+def validate_semantic_index(
+    chunks: DocumentChunks, embeddings: DocumentEmbeddings
+) -> None:
+    """Check source alignment before inference; leave model compatibility to caller."""
+    if chunks.document_id != embeddings.document_id:
+        raise ValueError("chunks and embeddings must belong to the same document")
+    if len(chunks.chunks) != len(embeddings.embeddings):
+        raise StaleSemanticIndexError("every chunk must have exactly one embedding")
+    source_digest = sha256(chunks.model_dump_json().encode("utf-8")).hexdigest()
+    if source_digest != embeddings.source_digest:
+        raise StaleSemanticIndexError(
+            "embeddings are stale: source digest does not match chunks"
+        )
+    for chunk, embedding in zip(chunks.chunks, embeddings.embeddings, strict=True):
+        if chunk.chunk_index != embedding.chunk_index:
+            raise ValueError("chunk and embedding indices must match")
+
+
 def _tokenize(query: str) -> set[str]:
     """Return distinct case-normalized words for simple keyword matching.
 
@@ -78,19 +100,11 @@ def search_semantic_chunks(
     cosine_similarity(query_vector, query_vector)
     if len(query_vector) != embeddings.dimensions:
         raise ValueError("query vector length must match embedding dimensions")
-    if chunks.document_id != embeddings.document_id:
-        raise ValueError("chunks and embeddings must belong to the same document")
-    if len(chunks.chunks) != len(embeddings.embeddings):
-        raise ValueError("every chunk must have exactly one embedding")
-    source_digest = sha256(chunks.model_dump_json().encode("utf-8")).hexdigest()
-    if source_digest != embeddings.source_digest:
-        raise ValueError("embeddings are stale: source digest does not match chunks")
+    validate_semantic_index(chunks, embeddings)
 
     semantic_hits: list[SemanticSearchHit] = []
 
     for chunk, embedding in zip(chunks.chunks, embeddings.embeddings, strict=True):
-        if chunk.chunk_index != embedding.chunk_index:
-            raise ValueError("chunk and embedding indices must match")
         similarity = cosine_similarity(query_vector, embedding.vector)
         semantic_hits.append(SemanticSearchHit(chunk=chunk, similarity=similarity))
 

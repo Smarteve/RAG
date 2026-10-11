@@ -1,6 +1,10 @@
 from nexusrag.constants import DEFAULT_EMBEDDING_BATCH_SIZE
 
 
+class EmbeddingInputError(ValueError):
+    """Text cannot be encoded without accepting blank input or truncation."""
+
+
 class MiniEmbedder:
     """Wrap an already-loaded model; construction never downloads model files."""
 
@@ -21,7 +25,7 @@ class MiniEmbedder:
 
     def embed_query(self, query: str) -> list[float]:
         if not query.strip():
-            raise ValueError("query must not be blank")
+            raise EmbeddingInputError("query must not be blank")
 
         encoded = self.model.tokenizer(
             query,
@@ -31,7 +35,7 @@ class MiniEmbedder:
 
         token_count = len(encoded["input_ids"])
         if token_count > self.model.max_seq_length:
-            raise ValueError(
+            raise EmbeddingInputError(
                 f"query has {token_count} tokens; limit is {self.model.max_seq_length}"
             )
 
@@ -52,7 +56,7 @@ class MiniEmbedder:
 
         for index, text in enumerate(texts):
             if not text.strip():
-                raise ValueError(f"document {index} must not be blank")
+                raise EmbeddingInputError(f"document {index} must not be blank")
 
         encoded = self.model.tokenizer(
             texts,
@@ -62,7 +66,7 @@ class MiniEmbedder:
         for index, token_ids in enumerate(encoded["input_ids"]):
             token_count = len(token_ids)
             if token_count > self.model.max_seq_length:
-                raise ValueError(
+                raise EmbeddingInputError(
                     f"document {index} has {token_count} tokens; "
                     f"limit is {self.model.max_seq_length}"
                 )

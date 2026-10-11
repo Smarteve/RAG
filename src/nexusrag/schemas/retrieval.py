@@ -23,3 +23,9 @@ class SearchResponse(BaseModel):
     document_id: UUID
     query: str
     hits: list[SearchHit]
+
+
+class SemanticSearchResponse(BaseModel):
+    document_id: UUID
+    query: str
+    hits: list[SemanticSearchHit]
