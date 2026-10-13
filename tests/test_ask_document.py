@@ -15,13 +15,14 @@ from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
 from nexusrag.schemas.answer import AskDocumentResponse, GeneratedAnswer
 from nexusrag.schemas.chunk import DocumentChunk, DocumentChunks
 from nexusrag.schemas.embedding import ChunkEmbedding, DocumentEmbeddings
-from nexusrag.services import context, generation, retrieval
+from nexusrag.services import context, generation, generation_runtime, retrieval
 from nexusrag.services.embedding_model import EmbeddingInputError, MiniEmbedder
 from nexusrag.services.embedding_runtime import EmbeddingRuntime
 from nexusrag.services.generation_runtime import (
     GenerationProviderError,
     GenerationTimeoutError,
     GenerationUnavailableError,
+    GroqAnswerGenerator,
 )
 
 main = import_module("nexusrag.main")
@@ -208,23 +209,38 @@ def test_insufficient_evidence_returns_200_without_sources(client, generator) ->
     assert response.json()["sources"] == []
 
 
-@pytest.mark.parametrize("empty", [False, True])
-def test_no_context_skips_generator_and_does_not_require_api_key(
+@pytest.mark.parametrize(
+    "empty", [False, True], ids=["budget_excluded", "empty_document"]
+)
+def test_empty_context_is_delegated_without_credentials_or_provider_call(
     client, generator, monkeypatch, empty
 ) -> None:
     chunks, _ = save_records(0 if empty else 3)
     if not empty:
         monkeypatch.setattr(config, "GENERATION_CONTEXT_TOKEN_BUDGET", 1)
-    generator.generate.side_effect = AssertionError(
-        "Empty context must not call the generator"
+    provider_constructor = Mock(
+        side_effect=AssertionError("Empty context must not create a provider client")
     )
+    # Replace the lazy binding without importing the SDK or making HTTP requests.
+    monkeypatch.setitem(
+        generation_runtime.__dict__,
+        "groq",
+        SimpleNamespace(AsyncGroq=provider_constructor),
+    )
+    generator.generate.side_effect = GroqAnswerGenerator().generate
 
     response = ask(client, chunks.document_id)
 
     assert response.status_code == 200
     assert response.json()["status"] == "insufficient_evidence"
     assert response.json()["sources"] == []
-    generator.generate.assert_not_awaited()
+    assert response.json()["answer"] == (
+        "The supplied sources do not provide enough evidence to answer this question."
+    )
+    generator.generate.assert_awaited_once_with(
+        QUESTION, context.PreparedContext("", {})
+    )
+    provider_constructor.assert_not_called()
 
 
 def test_default_retrieval_limit_is_five(client, generator) -> None:
