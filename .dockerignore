@@ -1,8 +1,13 @@
 .git
 .venv
+.venv-*
+data
 __pycache__
 *.py[cod]
 .pytest_cache
 .ruff_cache
 .gitignore
 design.md
+.env
+.env.*
+!.env.example

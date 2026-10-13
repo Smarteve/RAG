@@ -36,11 +36,18 @@ The planned flow is:
 The project currently has upload validation, local PDF storage, page-by-page text
 extraction, overlapping chunks with JSON storage and paginated fetching,
 single-document keyword and semantic search, explicit semantic-index building,
-tests, Docker, and CI configuration. AI-generated answers are not implemented.
-The first RAG milestone is answering a
-question about one text-based PDF with a supporting page citation.
+and a question-answer endpoint with citations through optional Groq generation.
+Tests, Docker, and CI configuration are included. The answer pipeline is tested
+offline with fake providers; real-model answer quality still needs manual evaluation.
+The first RAG milestone is answering a question about one text-based PDF with a
+supporting page citation, not a guarantee of factual correctness.
 
 ## Run locally
+
+Supported setup: Linux with Python 3.15.0 and uv 0.13.0. The lockfile resolves
+Linux dependencies only; macOS and Windows are not supported by this setup.
+`uv sync` installs the pinned interpreter if needed and creates `.venv`.
+CI and Docker use the same Python version.
 
 ```bash
 uv run uvicorn nexusrag.main:app --reload
@@ -251,8 +258,8 @@ running the demo or server. Relative paths resolve from the working directory;
 run both commands from the project root to use the same default cache.
 Text encoding runs locally, not through a hosted inference API.
 Dependencies also require downloads and additional disk/RAM beyond model weights.
-Linux/Windows use PyTorch's explicit CPU wheel index to avoid CUDA dependencies;
-macOS uses the normal PyPI build. See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/).
+Linux uses PyTorch's explicit CPU wheel index to avoid CUDA dependencies.
+See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/).
 
 MiniLM outputs 384 values per vector and has a default 256-token input limit.
 The demo checks the tokenizer's count, including special tokens, and rejects
@@ -352,6 +359,108 @@ over-budget queries `422`, an unavailable model `503`, and corrupt storage or
 internal failures a safe `500`. Model loading and query inference use the same
 serialized runtime as index building. Searches do not change saved records.
 
+### Ask a question and receive an answer
+
+Use semantic retrieval only for answers; keyword search remains a separate
+baseline. Install both optional extras and cache MiniLM as above. Put your Groq
+key in a local project-root `.env` file; paste its value after the equals sign:
+
+```dotenv
+GROQ_API_KEY=
+```
+
+Start the server from the project root with explicit environment-file loading:
+
+```bash
+uv sync --locked --extra embeddings --extra generation
+uv run --env-file .env --no-sync uvicorn nexusrag.main:app --reload
+```
+
+`uv --env-file` loads the file into the launched process's environment, so Python
+still reads the key through `os.environ`; no dotenv dependency is needed in the
+application. `.env` and `.env.*` are excluded from Git and Docker build context
+(except a future nonsecret `.env.example`). Do not force-add credentials to Git.
+The prepared `.env` starts with an empty key; fill it locally before asking.
+Existing exported environment variables take precedence: if an older key is
+still exported, run `unset GROQ_API_KEY` before starting to use the file's value.
+Restart the server after changing credentials. See the
+[uv environment-file option](https://docs.astral.sh/uv/reference/cli/#uv-run--env-file).
+To run the connection test with the same file, use
+`uv run --env-file .env --no-sync python examples/groq_smoke.py`.
+Stay on Groq's free tier if you want no usage charges. Quotas are limited and
+account-specific; upgrading billing changes the cost. See
+[Groq's limits](https://console.groq.com/docs/rate-limits).
+
+1. Upload a text-based PDF using POST `/documents`.
+2. Build its index using POST `/documents/{document_id}/semantic-index`.
+3. In `/docs`, use POST `/documents/{document_id}/ask` with:
+
+```json
+{"question": "How many vacation days do employees get?"}
+```
+
+An illustrative response is:
+
+```json
+{
+  "document_id": "00000000-0000-4000-8000-000000000001",
+  "question": "How many vacation days do employees get?",
+  "answer": "Employees receive 25 days of annual leave each year.",
+  "status": "answered",
+  "sources": [
+    {
+      "source_id": "S1",
+      "document_id": "00000000-0000-4000-8000-000000000001",
+      "page_number": 1,
+      "chunk_index": 0
+    }
+  ]
+}
+```
+
+Questions are stripped, must be nonblank, and have a 500-character limit. The
+MiniLM token limit also applies. The service retrieves up to five chunks using
+the existing compatible index; it never embeds document text again or rebuilds
+an index during /ask. The embedding lock is released before hosted generation.
+No source/index files are modified, and answers are not persisted.
+
+Context includes whole labelled passages while they fit a source-only budget of
+2048 tokens. For this first GPT-OSS integration, counting UTF-8 bytes provides a
+conservative bound for ordinary byte-level BPE text, not an exact token count.
+This may skip passages an exact tokenizer could fit. Instructions, the question,
+schema, provider framing, and up to 1024 output/reasoning tokens have separate
+room in the model window. This budget is not a per-minute quota guarantee. See
+the [GPT-OSS Harmony encoding](https://developers.openai.com/cookbook/articles/openai-harmony).
+Oversized source blocks are skipped without truncation; smaller later hits can
+still fit. If no source fits, /ask returns `insufficient_evidence` with an empty
+`sources` list, without needing generation credentials or a provider request.
+
+Groq receives the question and selected passage text, not the original PDF or
+embedding vectors. Use fictional/public documents for practice, not confidential
+material; consult [Groq's data controls](https://console.groq.com/docs/your-data).
+The configured model is `openai/gpt-oss-20b`, hosted by Groq. The LLM supplies
+answer/status/citation IDs; our application resolves actual document/page/chunk
+metadata. Invalid IDs, malformed JSON, and incomplete output are rejected.
+Valid citations establish traceability, not proof that every claim is supported.
+An unrelated question can still retrieve neighbours; no cosine threshold or
+hallucination-free guarantee is claimed. The model is instructed to report
+insufficient evidence when the passages do not answer the question.
+
+Invalid input returns `422`, unknown documents `404`, unavailable chunks or a
+missing/stale/incompatible index `409`, and unavailable local model or generation
+setup/credentials/model access/quota `503`. Generation timeouts return `504`;
+provider failures or invalid generated answers return `502`. Corrupt storage and
+internal failures return generic `500` responses. Provider details, keys, and
+document text are not included in error responses or logged by this route.
+The Groq SDK is imported lazily; each provider call owns/closes its client, has
+a 30-second request timeout, and disables automatic retries and model fallback.
+Other endpoints still work without the generation extra or key.
+
+Keep this learning API bound to localhost. Authentication, application rate
+limiting, and production deployment controls are not implemented. The existing
+Docker image does not install the optional model/provider extras; /ask is not
+ready in that image without a separate container setup update.
+
 ## Code responsibilities
 
 - `main.py` defines the HTTP endpoints, translates application errors into HTTP
@@ -363,8 +472,16 @@ serialized runtime as index building. Searches do not change saved records.
 - `services/chunking.py` splits extracted pages into traceable character windows
   without HTTP or filesystem operations.
 - `services/retrieval.py` ranks chunks with pure keyword or cosine-similarity
-  functions and checks semantic source alignment. HTTP endpoints handle loading,
-  query encoding, model compatibility, and error codes.
+  functions and checks semantic source alignment. `services/search.py` shares
+  model compatibility, query encoding, and semantic ranking between search and /ask.
+- `services/answering.py` loads saved records and coordinates retrieval, bounded
+  context, generation, and server-resolved source metadata. `services/context.py`
+  prepares labelled passages without loading a model or calling a provider.
+- `services/generation.py` validates generated answers/citation IDs;
+  `services/generation_runtime.py` owns Groq client lifecycle and translates SDK
+  failures into safe application errors. HTTP status selection stays in `main.py`.
+  Its top-level `lazy import groq` requires Python 3.15 and loads the optional SDK
+  only on first use; empty-context answers and API startup need no SDK.
 
 ## Checks and CI
 
@@ -381,3 +498,7 @@ The workflow in `.github/workflows/ci.yml` runs on pushes and pull requests,
 using Python from `.python-version`. View results in the repository Actions tab.
 The `--locked` option fails if `uv.lock` needs updating, keeping CI dependencies
 consistent with the committed lockfile.
+
+CI uses only base/dev dependencies and fake inference adapters: it needs no
+Groq key, generation SDK, model download, or external inference request.
+After the minimal CI sync above, reinstall both extras before a real /ask demo.

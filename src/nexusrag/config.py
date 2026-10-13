@@ -34,3 +34,8 @@ EMBEDDING_MODEL_CACHE_DIRECTORY = (
 
 EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+# Generation is hosted by Groq; this is separate from the local embedding model.
+GENERATION_MODEL_ID = "openai/gpt-oss-20b"
+# Source-only budget. Instructions, question, schema, and output have separate room.
+GENERATION_CONTEXT_TOKEN_BUDGET = 2048

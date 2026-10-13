@@ -8,17 +8,25 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from nexusrag import config
-from nexusrag.dependencies import get_embedding_runtime
+from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
+from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
 from nexusrag.schemas.chunk import FetchChunksResponse
 from nexusrag.schemas.document import UploadDocumentResponse
 from nexusrag.schemas.embedding import SemanticIndexResponse
 from nexusrag.schemas.extraction import FetchPageResponse
 from nexusrag.schemas.retrieval import SearchResponse, SemanticSearchResponse
-from nexusrag.services import indexing, ingestion, retrieval
+from nexusrag.services import answering, indexing, ingestion, retrieval, search
 from nexusrag.services.embedding_model import EmbeddingInputError
 from nexusrag.services.embedding_runtime import (
     EmbeddingModelUnavailableError,
     EmbeddingRuntime,
+)
+from nexusrag.services.generation import InvalidGeneratedAnswerError
+from nexusrag.services.generation_runtime import (
+    AnswerGenerator,
+    GenerationProviderError,
+    GenerationTimeoutError,
+    GenerationUnavailableError,
 )
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
@@ -316,32 +324,9 @@ async def semantic_search_document(
         raise HTTPException(500, detail="Could not load semantic index") from error
 
     try:
-        await run_in_threadpool(
-            retrieval.validate_semantic_index, chunk_record, embedding_record
+        hits = await search.semantic_search(
+            chunk_record, embedding_record, query, runtime, limit=limit
         )
-        # Reject a known old model/revision without loading the optional model.
-        if (
-            embedding_record.model_id != config.EMBEDDING_MODEL_ID
-            or embedding_record.model_revision != config.EMBEDDING_MODEL_REVISION
-        ):
-            raise retrieval.StaleSemanticIndexError("configured model does not match")
-
-        async with runtime.use_embedder() as embedder:
-            dimensions = await run_in_threadpool(embedder.get_dimensions)
-            if (
-                embedding_record.model_id != embedder.model_id
-                or embedding_record.model_revision != embedder.model_revision
-                or embedding_record.dimensions != dimensions
-            ):
-                raise retrieval.StaleSemanticIndexError("loaded model does not match")
-            query_vector = await run_in_threadpool(embedder.embed_query, query)
-            hits = await run_in_threadpool(
-                retrieval.search_semantic_chunks,
-                chunk_record,
-                embedding_record,
-                query_vector,
-                limit,
-            )
         return SemanticSearchResponse(document_id=document_id, query=query, hits=hits)
     except retrieval.StaleSemanticIndexError as error:
         raise HTTPException(
@@ -360,3 +345,59 @@ async def semantic_search_document(
         # Provider/schema failures are internal errors, not bad user input.
         logger.exception("Could not semantically search document %s", document_id)
         raise HTTPException(500, detail="Could not search document") from error
+
+
+@app.post("/documents/{document_id}/ask", response_model=AskDocumentResponse)
+async def ask_document(
+    document_id: UUID,
+    request: AskDocumentRequest,
+    runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
+    generator: Annotated[AnswerGenerator, Depends(get_answer_generator)],
+) -> AskDocumentResponse:
+    """Answer one question with server-resolved citations to existing PDF chunks."""
+    try:
+        return await answering.answer_document(
+            document_id,
+            request.question,
+            runtime,
+            generator,
+            storage_directory=config.STORAGE_DIRECTORY,
+            chunk_directory=config.CHUNK_DIRECTORY,
+            embedding_directory=config.EMBEDDING_DIRECTORY,
+        )
+    except answering.DocumentNotFoundError as error:
+        raise HTTPException(404, detail="Document not found") from error
+    except answering.DocumentChunksUnavailableError as error:
+        raise HTTPException(409, detail="Document chunks are not available") from error
+    except answering.SemanticIndexUnavailableError as error:
+        raise HTTPException(
+            409, detail="Semantic index is not available; build it before asking"
+        ) from error
+    except retrieval.StaleSemanticIndexError as error:
+        raise HTTPException(
+            409, detail="Semantic index is stale or incompatible; rebuild it"
+        ) from error
+    except EmbeddingInputError as error:
+        raise HTTPException(422, detail=str(error)) from error
+    except EmbeddingModelUnavailableError as error:
+        raise HTTPException(
+            503,
+            detail="Local embedding model unavailable; install the embeddings extra and cache the configured model",
+        ) from error
+    except GenerationUnavailableError as error:
+        logger.warning("Generation unavailable for document %s", document_id)
+        raise HTTPException(
+            503,
+            detail="Generation unavailable; check the generation extra, API key, model access, and quota",
+        ) from error
+    except GenerationTimeoutError as error:
+        raise HTTPException(504, detail="Answer generation timed out") from error
+    except (GenerationProviderError, InvalidGeneratedAnswerError) as error:
+        # Provider exceptions can contain prompts/response bodies; don't log them.
+        logger.warning("Generation failed for document %s", document_id)
+        raise HTTPException(502, detail="Could not generate a valid answer") from error
+    except Exception as error:
+        logger.error(
+            "Could not answer document %s (%s)", document_id, type(error).__name__
+        )
+        raise HTTPException(500, detail="Could not answer document") from error

@@ -6,10 +6,10 @@ readme = "README.md"
 authors = [
     { name = "evelyn", email = "evelynyyr11@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.15"
 dependencies = [
     "fastapi>=0.141.1",
-    "pydantic>=2.13.5",
+    "pydantic>=2.14.1",
     "pypdf>=6.19.0",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.53.0",
@@ -20,12 +20,15 @@ embeddings = [
     "sentence-transformers>=6.1.0,<7",
     "torch>=2.14.1,<3",
 ]
+generation = [
+    "groq>=1.7.0",
+]
 
 [project.scripts]
 nexusrag = "nexusrag:main"
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
+requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
@@ -36,8 +39,15 @@ dev = [
     "ruff>=0.16.8",
 ]
 
+[tool.ruff]
+target-version = "py315"
+
+[tool.uv]
+# Resolve only our supported deployment platform, including optional extras.
+environments = ["sys_platform == 'linux'"]
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torch = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
