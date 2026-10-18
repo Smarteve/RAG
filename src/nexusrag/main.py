@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
@@ -8,6 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from nexusrag import config
+from nexusrag.database import initialize_database
 from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
 from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
 from nexusrag.schemas.chunk import FetchChunksResponse
@@ -31,7 +33,15 @@ from nexusrag.services.generation_runtime import (
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
 logger = logging.getLogger(__name__)
-app = FastAPI(title="NexusRAG")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await run_in_threadpool(initialize_database, config.JOB_DATABASE_PATH)
+    yield
+
+
+app = FastAPI(title="NexusRAG", lifespan=lifespan)
 
 
 class HealthCheckResponse(BaseModel):

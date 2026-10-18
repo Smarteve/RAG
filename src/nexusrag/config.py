@@ -1,6 +1,12 @@
 import os
 from pathlib import Path
 
+JOB_DATABASE_PATH = (
+    Path(os.environ.get("NEXUSRAG_JOB_DATABASE_PATH", "data/jobs.sqlite3"))
+    .expanduser()
+    .resolve()
+)
+
 # Relative paths are resolved from the application's working directory.
 STORAGE_DIRECTORY = (
     Path(os.environ.get("NEXUSRAG_STORAGE_DIR", "data/documents"))
