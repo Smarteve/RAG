@@ -112,3 +112,32 @@ def _transition_job(
         return updated_job
     finally:
         connection.close()
+
+
+async def load_document_job(
+    document_id: UUID, database_path: Path
+) -> ProcessingJob | None:
+    """Find a document's processing job; legacy documents may have none."""
+    return await run_in_threadpool(_load_document_job, document_id, database_path)
+
+
+def _load_document_job(document_id: UUID, database_path: Path) -> ProcessingJob | None:
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT job_id, record FROM processing_jobs "
+            "WHERE json_extract(record, '$.document_id') = ?",
+            (str(document_id),),
+        ).fetchall()
+        if not rows:
+            return None
+        # Multiple attempts need an explicit retry policy, not arbitrary selection.
+        if len(rows) != 1:
+            raise ValueError("Multiple processing jobs for document")
+        stored_id, record = rows[0]
+        job = ProcessingJob.model_validate_json(record)
+        if str(job.job_id) != stored_id or job.document_id != document_id:
+            raise ValueError("Stored job identity mismatch")
+        return job
+    finally:
+        connection.close()

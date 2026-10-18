@@ -592,3 +592,65 @@ def test_blank_document_needs_no_generation_configuration(client) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "insufficient_evidence"
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "failed", "succeeded"])
+def test_processing_status_gates_answers(client, generator, loader, status):
+    from datetime import UTC, datetime
+
+    from nexusrag.schemas.job import ProcessingJob
+    from nexusrag.services.job_storage import create_job, transition_job
+
+    # Complete artifacts must not bypass queued/running/failed job status.
+    chunks, _ = save_records()
+    now = datetime.now(UTC)
+    job = ProcessingJob(
+        job_id=uuid4(),
+        document_id=chunks.document_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+    )
+    asyncio.run(create_job(job, config.JOB_DATABASE_PATH))
+    if status != "queued":
+        asyncio.run(transition_job(job.job_id, "running", config.JOB_DATABASE_PATH))
+    if status in {"succeeded", "failed"}:
+        asyncio.run(
+            transition_job(
+                job.job_id,
+                status,
+                config.JOB_DATABASE_PATH,
+                error="Document processing failed" if status == "failed" else None,
+            )
+        )
+    response = client.post(
+        f"/documents/{chunks.document_id}/ask", json={"question": QUESTION}
+    )
+    if status == "succeeded":
+        assert response.status_code == 200
+        generator.generate.assert_awaited_once()
+    else:
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "message": "Document processing failed"
+            if status == "failed"
+            else "Document is still processing",
+            "job_id": str(job.job_id),
+            "status": status,
+        }
+        generator.generate.assert_not_awaited()
+        loader.assert_not_called()
+
+
+def test_readiness_database_failure_is_safe(client, monkeypatch, generator):
+    import sqlite3
+
+    monkeypatch.setattr(
+        main,
+        "load_document_job",
+        AsyncMock(side_effect=sqlite3.OperationalError("private path")),
+    )
+    response = client.post(f"/documents/{uuid4()}/ask", json={"question": QUESTION})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Could not check document readiness"}
+    generator.generate.assert_not_awaited()

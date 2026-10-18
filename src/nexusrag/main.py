@@ -32,7 +32,7 @@ from nexusrag.services.generation_runtime import (
     GenerationTimeoutError,
     GenerationUnavailableError,
 )
-from nexusrag.services.job_storage import load_job
+from nexusrag.services.job_storage import load_document_job, load_job
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
 logger = logging.getLogger(__name__)
@@ -359,6 +359,24 @@ async def ask_document(
     generator: Annotated[AnswerGenerator, Depends(get_answer_generator)],
 ) -> AskDocumentResponse:
     """Answer one question with server-resolved citations to existing PDF chunks."""
+    try:
+        job = await load_document_job(document_id, config.JOB_DATABASE_PATH)
+    except (sqlite3.Error, OSError, ValueError) as error:
+        logger.exception("Could not check readiness for document %s", document_id)
+        raise HTTPException(500, detail="Could not check document readiness") from error
+
+    if job is not None and job.status != "succeeded":
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Document processing failed"
+                if job.status == "failed"
+                else "Document is still processing",
+                "job_id": str(job.job_id),
+                "status": job.status,
+            },
+        )
+
     try:
         return await answering.answer_document(
             document_id,

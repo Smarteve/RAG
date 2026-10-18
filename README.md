@@ -126,8 +126,11 @@ with a safe public error. Partial extraction/chunk artifacts may remain, but
 success is recorded only after indexing finishes. Each index JSON is published
 atomically. Automatic retries and interrupted-job recovery are not implemented.
 Upload metadata is validated but is not persisted or returned. OCR is not
-implemented. Explicit readiness gating remains follow-up work; retrieval requires completed
-processing artifacts.
+implemented. `/ask` checks the document processing job before retrieval. Queued, running,
+and failed jobs return `409` with a safe message, job ID, and status. Successful
+jobs continue through the existing artifact/index checks. Documents created
+before job tracking retain those artifact checks. Database errors fail closed
+with `500`.
 
 To read an extracted page, use
 `GET /documents/{document_id}/pages/{page_number}` with the ID returned by upload.
