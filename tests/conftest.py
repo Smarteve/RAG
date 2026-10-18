@@ -11,3 +11,44 @@ def chunk_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     directory = tmp_path / "chunks"
     monkeypatch.setattr(config, "CHUNK_DIRECTORY", directory)
     return directory
+
+
+@pytest.fixture
+def prepare_document():
+    """Prepare retrieval fixtures without depending on queued HTTP uploads."""
+    import asyncio
+    from io import BytesIO
+
+    from fastapi import UploadFile
+    from starlette.datastructures import Headers
+
+    from nexusrag.services.ingestion import ingest_document
+
+    def prepare(contents: bytes):
+        upload = UploadFile(
+            file=BytesIO(contents),
+            filename="sample.pdf",
+            headers=Headers({"content-type": "application/pdf"}),
+        )
+        try:
+            result = asyncio.run(
+                ingest_document(
+                    upload,
+                    config.STORAGE_DIRECTORY,
+                    config.EXTRACTION_DIRECTORY,
+                    config.CHUNK_DIRECTORY,
+                )
+            )
+            return result.extraction.document_id
+        finally:
+            upload.file.close()
+
+    return prepare
+
+
+@pytest.fixture(autouse=True)
+def job_database_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep application startup from creating real job records in tests."""
+    path = tmp_path / "jobs.sqlite3"
+    monkeypatch.setattr(config, "JOB_DATABASE_PATH", path)
+    return path

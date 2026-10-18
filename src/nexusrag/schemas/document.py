@@ -37,3 +37,9 @@ class UploadDocumentResponse(BaseModel):
     page_count: int | None = Field(ge=0)
     extraction_error: ExtractionErrorCode | None = None
     chunk_count: int | None = Field(default=None, ge=0)
+
+
+class QueuedUploadResponse(BaseModel):
+    document_id: UUID
+    job_id: UUID
+    status: Literal["queued"] = "queued"

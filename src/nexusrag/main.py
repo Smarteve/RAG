@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
@@ -13,9 +14,10 @@ from nexusrag.database import initialize_database
 from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
 from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
 from nexusrag.schemas.chunk import FetchChunksResponse
-from nexusrag.schemas.document import UploadDocumentResponse
+from nexusrag.schemas.document import QueuedUploadResponse
 from nexusrag.schemas.embedding import SemanticIndexResponse
 from nexusrag.schemas.extraction import FetchPageResponse
+from nexusrag.schemas.job import ProcessingJob
 from nexusrag.schemas.retrieval import SearchResponse, SemanticSearchResponse
 from nexusrag.services import answering, indexing, ingestion, retrieval, search
 from nexusrag.services.embedding_model import EmbeddingInputError
@@ -30,6 +32,7 @@ from nexusrag.services.generation_runtime import (
     GenerationTimeoutError,
     GenerationUnavailableError,
 )
+from nexusrag.services.job_storage import load_job
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
 logger = logging.getLogger(__name__)
@@ -53,29 +56,24 @@ async def health_check() -> HealthCheckResponse:
     return HealthCheckResponse(status="ok")
 
 
-@app.post("/documents", response_model=UploadDocumentResponse, status_code=201)
-async def upload_document(file: UploadFile) -> UploadDocumentResponse:
-    """Translate ingestion results/errors into HTTP and close the owned upload."""
+@app.get("/jobs/{job_id}", response_model=ProcessingJob)
+async def fetch_job(job_id: UUID) -> ProcessingJob:
+    """Return the persisted status of a document-processing job."""
     try:
-        result = await ingestion.ingest_document(
-            file,
-            config.STORAGE_DIRECTORY,
-            config.EXTRACTION_DIRECTORY,
-            config.CHUNK_DIRECTORY,
-        )
-        extraction = result.extraction
+        return await load_job(job_id, config.JOB_DATABASE_PATH)
+    except FileNotFoundError as error:
+        raise HTTPException(404, detail="Job not found") from error
+    except (sqlite3.Error, OSError, ValueError) as error:
+        logger.exception("Could not load processing job %s", job_id)
+        raise HTTPException(500, detail="Could not load job") from error
 
-        return UploadDocumentResponse(
-            document_id=extraction.document_id,
-            metadata=result.metadata,
-            extraction_status=extraction.status,
-            page_count=len(extraction.pages)
-            if extraction.status == "completed"
-            else None,
-            extraction_error=extraction.error,
-            chunk_count=len(result.chunks.chunks)
-            if result.chunks is not None
-            else None,
+
+@app.post("/documents", response_model=QueuedUploadResponse, status_code=202)
+async def upload_document(file: UploadFile) -> QueuedUploadResponse:
+    """Accept a stored document for background processing; close the upload."""
+    try:
+        return await ingestion.submit_document(
+            file, config.STORAGE_DIRECTORY, config.JOB_DATABASE_PATH
         )
     except ingestion.UnsupportedDocumentError as error:
         raise HTTPException(415, detail=str(error)) from error
@@ -83,16 +81,12 @@ async def upload_document(file: UploadFile) -> UploadDocumentResponse:
         raise HTTPException(422, detail=str(error)) from error
     except ingestion.UploadTooLargeError as error:
         raise HTTPException(413, detail=str(error)) from error
-    except ingestion.DocumentStorageError as error:
+    except (ingestion.DocumentStorageError, ingestion.JobStorageError) as error:
+        logger.exception("Could not persist document submission")
         raise HTTPException(500, detail=str(error)) from error
-    except (ingestion.ExtractionStorageError, ingestion.ChunkStorageError) as error:
-        raise HTTPException(
-            500,
-            detail={
-                "message": str(error),
-                "document_id": str(error.document_id),
-            },
-        ) from error
+    except ingestion.QueueSubmissionError as error:
+        logger.exception("Could not confirm document queue acceptance")
+        raise HTTPException(503, detail=str(error)) from error
     finally:
         await file.close()
 

@@ -1,7 +1,7 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -164,13 +164,9 @@ def test_missing_chunks_existence_check_is_offloaded(
     assert response.json() == {"detail": "Could not load chunks"}
 
 
-def test_upload_then_fetch_chunks_preserves_source_text() -> None:
+def test_upload_then_fetch_chunks_preserves_source_text(prepare_document) -> None:
     contents = SAMPLE_PDF.read_bytes()
-    upload = client.post(
-        "/documents", files={"file": ("handbook.pdf", contents, "application/pdf")}
-    )
-    assert upload.status_code == 201
-    document_id = UUID(upload.json()["document_id"])
+    document_id = prepare_document(contents)
 
     response = client.get(f"/documents/{document_id}/chunks", params={"limit": 100})
 
@@ -179,11 +175,7 @@ def test_upload_then_fetch_chunks_preserves_source_text() -> None:
     extraction = asyncio.run(
         storage.load_extraction(document_id, config.EXTRACTION_DIRECTORY)
     )
-    assert (
-        response.json()["total_chunks"]
-        == upload.json()["chunk_count"]
-        == len(record.chunks)
-    )
+    assert response.json()["total_chunks"] == len(record.chunks)
     assert response.json()["chunks"] == [
         chunk.model_dump(mode="json") for chunk in record.chunks
     ]
@@ -194,49 +186,38 @@ def test_upload_then_fetch_chunks_preserves_source_text() -> None:
     assert (config.STORAGE_DIRECTORY / f"{document_id}.pdf").read_bytes() == contents
 
 
-def test_blank_upload_saves_empty_chunks_and_fetches_successfully() -> None:
+def test_blank_upload_saves_empty_chunks_and_fetches_successfully(
+    prepare_document,
+) -> None:
     with BytesIO() as output, PdfWriter() as writer:
         writer.add_blank_page(width=595, height=842)
         writer.write(output)
         contents = output.getvalue()
-    upload = client.post(
-        "/documents", files={"file": ("blank.pdf", contents, "application/pdf")}
-    )
-
-    assert upload.status_code == 201
-    assert upload.json()["chunk_count"] == 0
-    response = client.get(f"/documents/{upload.json()['document_id']}/chunks")
+    document_id = prepare_document(contents)
+    response = client.get(f"/documents/{document_id}/chunks")
     assert response.status_code == 200
     assert response.json()["total_chunks"] == 0
     assert response.json()["chunks"] == []
 
 
-def test_failed_extraction_does_not_create_chunks() -> None:
-    upload = client.post(
-        "/documents",
-        files={"file": ("broken.pdf", b"%PDF-1.4\nbroken", "application/pdf")},
-    )
-
-    assert upload.status_code == 201
-    assert upload.json()["chunk_count"] is None
-    response = client.get(f"/documents/{upload.json()['document_id']}/chunks")
+def test_failed_extraction_does_not_create_chunks(prepare_document) -> None:
+    document_id = prepare_document(b"%PDF-1.4\nbroken")
+    response = client.get(f"/documents/{document_id}/chunks")
     assert response.status_code == 409
     assert not config.CHUNK_DIRECTORY.exists()
 
 
 def test_chunk_storage_failure_retains_pdf_and_extraction(
     chunk_directory: Path,
+    prepare_document,
 ) -> None:
+    from nexusrag.services.ingestion import ChunkStorageError
+
     chunk_directory.write_bytes(b"existing data")
     contents = SAMPLE_PDF.read_bytes()
-    upload = client.post(
-        "/documents", files={"file": ("handbook.pdf", contents, "application/pdf")}
-    )
-
-    assert upload.status_code == 500
-    detail = upload.json()["detail"]
-    assert detail["message"] == "Could not save document chunks"
-    document_id = UUID(detail["document_id"])
+    with pytest.raises(ChunkStorageError) as caught:
+        prepare_document(contents)
+    document_id = caught.value.document_id
     assert (config.STORAGE_DIRECTORY / f"{document_id}.pdf").read_bytes() == contents
     assert (
         asyncio.run(

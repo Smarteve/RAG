@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -182,13 +182,8 @@ def test_fetch_uses_stored_page_number_when_list_order_differs() -> None:
     assert response.json()["page"] == {"page_number": 3, "text": "Page three"}
 
 
-def test_upload_then_fetch_page() -> None:
-    upload = client.post(
-        "/documents",
-        files={"file": ("handbook.pdf", SAMPLE_PDF.read_bytes(), "application/pdf")},
-    )
-    assert upload.status_code == 201
-    document_id = UUID(upload.json()["document_id"])
+def test_upload_then_fetch_page(prepare_document) -> None:
+    document_id = prepare_document(SAMPLE_PDF.read_bytes())
 
     response = client.get(f"/documents/{document_id}/pages/1")
 

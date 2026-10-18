@@ -55,11 +55,36 @@ uv run uvicorn nexusrag.main:app --reload
 
 Then open <http://127.0.0.1:8000/docs>.
 
-`POST /documents` saves accepted PDFs, waits for extraction and chunking in worker
-threads, and saves both results as UTF-8 JSON. It returns `201 Created` with
-`document_id`, nested `metadata`, `extraction_status`, `page_count`, and
-`extraction_error`, plus `chunk_count`. Filesystem paths and full text are not
-returned in the upload response.
+`POST /documents` validates and saves the PDF, records a queued job in SQLite,
+and submits its ID to RQ through Redis. It returns `202 Accepted` with
+`document_id`, `job_id`, and `status: "queued"`. Acceptance does not mean the
+PDF has been extracted or indexed. A separate worker performs that work.
+
+Start Redis with `docker compose up -d redis`. Initialize the API by running
+the Uvicorn command above, then start a worker from the same project directory:
+
+```bash
+uv run rq worker --url redis://localhost:6379/0 --serializer json ingestion
+```
+
+The API and worker must share the configured database, source directories, and
+cached local embedding model. Defaults use `data/jobs.sqlite3`, queue `ingestion`,
+and Redis at `redis://localhost:6379/0`. Environment overrides are
+`NEXUSRAG_JOB_DATABASE_PATH`, `NEXUSRAG_INGESTION_QUEUE_NAME`, and
+`NEXUSRAG_REDIS_URL`. Pass matching queue/URL options to the worker CLI.
+
+PDF or job persistence failure returns `500`; unconfirmed queue acceptance
+returns `503`. Source PDFs and queued records are retained after enqueue errors
+because delivery may have succeeded before a connection failed. There is no
+automatic reconciliation or submission deduplication yet; blindly retrying an
+upload may create another document.
+
+Use `GET /jobs/{job_id}` (also available in `/docs`) with the ID returned by
+upload to check progress. It returns the job/document IDs, status (`queued`,
+`running`, `succeeded`, or `failed`), creation/update timestamps, and an optional
+safe error. Unknown IDs return `404`, invalid UUIDs return `422`, and corrupt
+records or database failures return a generic `500`. Ask questions after the
+job reaches `succeeded`.
 
 The same UUID links the original and extracted data:
 
@@ -96,22 +121,13 @@ already-published document into a failed upload. There is no automatic stale-fil
 cleanup yet. This protects final paths from partial writes, but without `fsync`
 it does not guarantee durability across power loss.
 
-Known PDF parsing or source-reading failures retain the original PDF and save
-a failed extraction record with no pages and a safe error code. The response is
-still `201` because the document was stored, but `extraction_status` is `failed`
-and `page_count` and `chunk_count` are `null`; no chunk record is created.
-A successful extraction with only blank text saves an empty chunk record and
-returns `chunk_count: 0`. A scanned page may have empty text without a parsing
-error; OCR is not implemented.
-
-If JSON storage fails, the API returns `500` with the saved `document_id` in
-`detail`, and retains the PDF. No extraction record is guaranteed if extraction
-JSON storage fails. If chunk JSON storage fails, the PDF and extraction JSON
-are retained. Internally generated chunk-validation failures are programming
-errors, not client validation failures; they are not silently skipped.
-There is no automatic retry or database yet. Upload metadata
-is returned but not persisted. A process crash between PDF and JSON storage can
-also leave a PDF without a result; the three files are not a single transactional write.
+Worker processing failures retain the source PDF and mark the job `failed`
+with a safe public error. Partial extraction/chunk artifacts may remain, but
+success is recorded only after indexing finishes. Each index JSON is published
+atomically. Automatic retries and interrupted-job recovery are not implemented.
+Upload metadata is validated but is not persisted or returned. OCR is not
+implemented. Explicit readiness gating remains follow-up work; retrieval requires completed
+processing artifacts.
 
 To read an extracted page, use
 `GET /documents/{document_id}/pages/{page_number}` with the ID returned by upload.
@@ -317,7 +333,7 @@ The API loads the pinned CPU model lazily from the local cache only, using
 [`local_files_only=True`](https://www.sbert.net/docs/package_reference/sentence_transformer/model.html).
 Requests do not initiate model downloads. One model is reused per application
 process, with loading and inference offloaded and serialized. Multiple server
-processes each have their own model and lock; there is no background queue yet.
+processes each have their own model and lock; document ingestion uses a separate RQ worker.
 
 Invalid UUIDs return `422`, unknown documents `404`, and PDFs without available
 chunks `409`. Blank or over-token-budget chunk text also returns `409`; adjust

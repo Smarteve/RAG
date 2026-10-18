@@ -1,9 +1,12 @@
 """Coordinate document ingestion without choosing HTTP response codes."""
 
 import logging
+import sqlite3
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -15,10 +18,17 @@ from nexusrag.constants import (
     DEFAULT_CHUNK_SIZE_CHARS,
 )
 from nexusrag.schemas.chunk import DocumentChunks
-from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES, DocumentMetadata
+from nexusrag.schemas.document import (
+    MAX_DOCUMENT_SIZE_BYTES,
+    DocumentMetadata,
+    QueuedUploadResponse,
+)
 from nexusrag.schemas.extraction import DocumentExtraction
+from nexusrag.schemas.job import ProcessingJob
 from nexusrag.services.chunking import chunk_document
 from nexusrag.services.extraction import DocumentExtractionError, extract_pages
+from nexusrag.services.job_storage import create_job
+from nexusrag.services.queue import enqueue_processing
 from nexusrag.storage import save_chunks, save_document, save_extraction
 
 logger = logging.getLogger(__name__)
@@ -169,3 +179,50 @@ async def _extract_document(document_id: UUID, pdf_path: Path) -> DocumentExtrac
             status="failed",
             error="source_read_failed",
         )
+
+
+class JobStorageError(Exception):
+    """The submission could not be recorded in job storage."""
+
+
+class QueueSubmissionError(Exception):
+    """Queue acceptance could not be confirmed; source and job are retained."""
+
+
+async def submit_document(
+    file: UploadFile,
+    storage_directory: Path,
+    database_path: Path,
+    enqueue: Callable[[UUID], Awaitable[None]] | None = None,
+) -> QueuedUploadResponse:
+    """Save the source and job before enqueueing; caller closes the upload.
+
+    Redis and SQLite do not share a transaction. An enqueue error can be
+    ambiguous, so retain the queued record and source for later reconciliation.
+    Never claim acceptance when enqueueing raises.
+    """
+    await _validate_pdf_upload(file)
+    try:
+        document_id, _ = await save_document(file, storage_directory)
+    except OSError as error:
+        raise DocumentStorageError("Could not save document") from error
+
+    now = datetime.now(UTC)
+    job = ProcessingJob(
+        job_id=uuid4(),
+        document_id=document_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+    )
+    try:
+        await create_job(job, database_path)
+    except (sqlite3.Error, OSError) as error:
+        raise JobStorageError("Could not save processing job") from error
+
+    try:
+        await (enqueue if enqueue is not None else enqueue_processing)(job.job_id)
+    except Exception as error:
+        raise QueueSubmissionError("Could not confirm queue acceptance") from error
+
+    return QueuedUploadResponse(document_id=document_id, job_id=job.job_id)

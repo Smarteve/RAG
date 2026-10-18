@@ -1,440 +1,116 @@
 import asyncio
+import sqlite3
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
-from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DecodedStreamObject, NameObject
 from starlette.datastructures import Headers
 
-from nexusrag import config, main, storage
-from nexusrag.constants import CHUNK_SIZE_BYTES
-from nexusrag.main import app
-from nexusrag.schemas.chunk import DocumentChunk
+from nexusrag import config
+from nexusrag.database import initialize_database
+from nexusrag.main import app, upload_document
 from nexusrag.schemas.document import MAX_DOCUMENT_SIZE_BYTES
-from nexusrag.schemas.extraction import DocumentExtraction
 from nexusrag.services import ingestion
-
-client = TestClient(app)
-SAMPLE_PDF = Path(__file__).resolve().parents[1] / "examples/employee-handbook.pdf"
+from nexusrag.services.job_storage import load_job
 
 
 @pytest.fixture(autouse=True)
-def storage_directory(tmp_path: Path, monkeypatch) -> Path:
-    directory = tmp_path / "documents"
-    monkeypatch.setattr(config, "STORAGE_DIRECTORY", directory)
-    return directory
+def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job_database_path):
+    monkeypatch.setattr(config, "STORAGE_DIRECTORY", tmp_path / "documents")
+    monkeypatch.setattr(config, "JOB_DATABASE_PATH", tmp_path / "jobs.sqlite3")
+    initialize_database(config.JOB_DATABASE_PATH)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(ingestion, "enqueue_processing", enqueue)
+    return enqueue
 
 
-@pytest.fixture(autouse=True)
-def extraction_directory(tmp_path: Path, monkeypatch) -> Path:
-    directory = tmp_path / "extracted"
-    monkeypatch.setattr(config, "EXTRACTION_DIRECTORY", directory)
-    return directory
+def test_upload_persists_before_enqueueing(setup):
+    contents = b"%PDF-1.4\nbroken PDF; parsing belongs to worker"
 
+    async def check_saved(job_id):
+        job = await load_job(job_id, config.JOB_DATABASE_PATH)
+        assert job.status == "queued"
+        assert (
+            config.STORAGE_DIRECTORY / f"{job.document_id}.pdf"
+        ).read_bytes() == contents
 
-@pytest.mark.parametrize("padding", [0, CHUNK_SIZE_BYTES])
-def test_pdf_upload_returns_document_metadata(
-    padding: int, storage_directory: Path, extraction_directory: Path
-) -> None:
-    # Use a real PDF; a signature alone no longer represents successful parsing.
-    with SAMPLE_PDF.open("rb") as source, BytesIO() as output, PdfWriter() as writer:
-        for page in PdfReader(source).pages:
-            writer.add_page(page)
-        writer.add_metadata({"/Subject": "x" * padding})
-        writer.write(output)
-        file_contents = output.getvalue()
-
-    response = client.post(
-        "/documents",
-        files={"file": ("invoice.pdf", file_contents, "application/pdf")},
-    )
-
-    assert response.status_code == 201
+    setup.side_effect = check_saved
+    with TestClient(app) as client:
+        response = client.post(
+            "/documents", files={"file": ("sample.pdf", contents, "application/pdf")}
+        )
+    assert response.status_code == 202
     body = response.json()
-    document_id = UUID(body["document_id"])
-    assert body["metadata"]["filename"] == "invoice.pdf"
-    assert body["metadata"]["media_type"] == "application/pdf"
-    assert body["metadata"]["size_bytes"] == len(file_contents)
-    assert (storage_directory / f"{document_id}.pdf").read_bytes() == file_contents
-    assert body["extraction_status"] == "completed"
-    assert body["page_count"] == 2
-    assert body["extraction_error"] is None
-    assert set(body) == {
-        "document_id",
-        "metadata",
-        "extraction_status",
-        "page_count",
-        "extraction_error",
-        "chunk_count",
-    }
-    assert set(body["metadata"]) == {
-        "filename",
-        "media_type",
-        "size_bytes",
-        "uploaded_at",
-        "source_created_at",
-    }
-    result = DocumentExtraction.model_validate_json(
-        (extraction_directory / f"{document_id}.json").read_text(encoding="utf-8")
-    )
-    assert result.document_id == document_id
-    assert result.status == "completed"
-    assert result.error is None
-    assert [page.page_number for page in result.pages] == [1, 2]
-    assert "Annual leave" in result.pages[0].text
-    assert "Remote work" in result.pages[1].text
-
-
-def test_non_pdf_upload_is_rejected() -> None:
-    response = client.post(
-        "/documents",
-        files={"file": ("notes.txt", b"notes", "text/plain")},
-    )
-
-    assert response.status_code == 415
-    assert response.json()["detail"] == "Only PDF uploads are supported"
-
-
-def test_upload_larger_than_limit_is_rejected() -> None:
-    response = client.post(
-        "/documents",
-        files={
-            "file": (
-                "large.pdf",
-                b"%PDF-" + b"x" * (MAX_DOCUMENT_SIZE_BYTES - 4),
-                "application/pdf",
-            )
-        },
-    )
-
-    assert response.status_code == 413
-    assert response.json()["detail"] == "File must not exceed 25 MiB"
-
-
-@pytest.mark.parametrize("contents", [b"not really a PDF", b"", b"%PDF"])
-def test_invalid_pdf_signature_is_rejected(contents: bytes) -> None:
-    response = client.post(
-        "/documents",
-        files={"file": ("fake.pdf", contents, "application/pdf")},
-    )
-
-    assert response.status_code == 415
-    assert response.json()["detail"] == "Uploaded content is not a valid PDF"
-
-
-def test_invalid_filename_returns_validation_error(storage_directory: Path) -> None:
-    response = client.post(
-        "/documents",
-        files={"file": ("../invoice.pdf", b"%PDF-1.7\ncontents", "application/pdf")},
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == "Invalid document metadata"
-    assert not storage_directory.exists()
-
-
-def test_storage_failure_returns_server_error(storage_directory: Path) -> None:
-    # A file in place of a directory makes mkdir fail on every platform.
-    storage_directory.write_bytes(b"existing data")
-    response = client.post(
-        "/documents",
-        files={"file": ("invoice.pdf", b"%PDF-1.7\ncontents", "application/pdf")},
-    )
-
-    assert response.status_code == 500
-    assert response.json() == {"detail": "Could not save document"}
-    assert storage_directory.read_bytes() == b"existing data"
-
-
-def test_parse_failure_keeps_pdf_and_persists_failed_status(
-    storage_directory: Path, extraction_directory: Path
-) -> None:
-    contents = b"%PDF-1.4\nbroken PDF\n"
-    response = client.post(
-        "/documents", files={"file": ("broken.pdf", contents, "application/pdf")}
-    )
-
-    assert response.status_code == 201
-    body = response.json()
-    document_id = UUID(body["document_id"])
-    assert body["extraction_status"] == "failed"
-    assert body["page_count"] is None
-    assert body["extraction_error"] == "pdf_read_failed"
-    assert body["chunk_count"] is None
-    assert (storage_directory / f"{document_id}.pdf").read_bytes() == contents
-    result = DocumentExtraction.model_validate_json(
-        (extraction_directory / f"{document_id}.json").read_text(encoding="utf-8")
-    )
-    assert result.status == "failed"
-    assert result.error == "pdf_read_failed"
-    assert result.pages == []
-
-
-def test_unsupported_pdf_filter_keeps_pdf_and_persists_failed_status(
-    storage_directory: Path, extraction_directory: Path
-) -> None:
-    with SAMPLE_PDF.open("rb") as source, BytesIO() as output, PdfWriter() as writer:
-        # Preserve font resources so pypdf actually attempts text extraction.
-        # A blank page without fonts can return empty text before decoding.
-        page = writer.add_page(PdfReader(source).pages[0])
-        stream = DecodedStreamObject()
-        stream.set_data(b"BT ET")
-        stream[NameObject("/Filter")] = NameObject("/UnsupportedDecode")
-        page[NameObject("/Contents")] = writer._add_object(stream)
-        writer.write(output)
-        contents = output.getvalue()
-
-    response = client.post(
-        "/documents", files={"file": ("unsupported.pdf", contents, "application/pdf")}
-    )
-
-    assert response.status_code == 201
-    body = response.json()
-    document_id = UUID(body["document_id"])
-    assert body["extraction_status"] == "failed"
-    assert body["extraction_error"] == "pdf_read_failed"
-    assert body["page_count"] is None
-    assert "UnsupportedDecode" not in response.text
-    assert (storage_directory / f"{document_id}.pdf").read_bytes() == contents
-    result = DocumentExtraction.model_validate_json(
-        (extraction_directory / f"{document_id}.json").read_text(encoding="utf-8")
-    )
-    assert result.document_id == document_id
-    assert result.status == "failed"
-    assert result.error == "pdf_read_failed"
-    assert result.pages == []
-
-
-def test_source_read_failure_is_recorded_without_exposing_internal_error(
-    storage_directory: Path, extraction_directory: Path, monkeypatch
-) -> None:
-    def fail_read(path: Path):
-        raise PermissionError("Private server path /internal/storage")
-
-    monkeypatch.setattr(ingestion, "extract_pages", fail_read)
-    contents = SAMPLE_PDF.read_bytes()
-    response = client.post(
-        "/documents", files={"file": ("sample.pdf", contents, "application/pdf")}
-    )
-
-    assert response.status_code == 201
-    body = response.json()
-    document_id = UUID(body["document_id"])
-    assert body["extraction_status"] == "failed"
-    assert body["extraction_error"] == "source_read_failed"
-    assert body["page_count"] is None
-    assert "Private server path" not in response.text
-    assert (storage_directory / f"{document_id}.pdf").read_bytes() == contents
-    result = DocumentExtraction.model_validate_json(
-        (extraction_directory / f"{document_id}.json").read_text(encoding="utf-8")
-    )
-    assert result.status == "failed"
-    assert result.error == "source_read_failed"
-
-
-@pytest.mark.parametrize("valid_pdf", [True, False])
-def test_extraction_storage_failure_returns_id_and_keeps_pdf(
-    storage_directory: Path, extraction_directory: Path, valid_pdf: bool
-) -> None:
-    extraction_directory.write_bytes(b"existing data")
-    contents = SAMPLE_PDF.read_bytes() if valid_pdf else b"%PDF-1.4\nbroken\n"
-    response = client.post(
-        "/documents", files={"file": ("sample.pdf", contents, "application/pdf")}
-    )
-
-    assert response.status_code == 500
-    detail = response.json()["detail"]
-    assert detail["message"] == "Could not save extraction result"
-    document_id = UUID(detail["document_id"])
-    assert (storage_directory / f"{document_id}.pdf").read_bytes() == contents
-    assert extraction_directory.read_bytes() == b"existing data"
-
-
-def test_blank_pdf_is_successful_extraction() -> None:
-    with BytesIO() as output, PdfWriter() as writer:
-        writer.add_blank_page(width=595, height=842)
-        writer.write(output)
-        contents = output.getvalue()
-    response = client.post(
-        "/documents", files={"file": ("blank.pdf", contents, "application/pdf")}
-    )
-
-    assert response.status_code == 201
-    assert response.json()["extraction_status"] == "completed"
-    assert response.json()["page_count"] == 1
-    assert response.json()["chunk_count"] == 0
-
-
-def test_processing_and_storage_helpers_run_outside_event_loop(
-    monkeypatch,
-) -> None:
-    original_extract = ingestion.extract_pages
-    original_save_document = storage._save_document
-    original_save = storage._save_extraction
-    original_chunk = ingestion._chunk_extraction
-    original_save_chunks = storage._save_chunks
-    calls = []
-
-    def save_pdf_in_worker(source, directory):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        calls.append("pdf")
-        return original_save_document(source, directory)
-
-    def extract_in_worker(path):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        calls.append("extract")
-        return original_extract(path)
-
-    def save_in_worker(extraction, directory):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        calls.append("save")
-        return original_save(extraction, directory)
-
-    def chunk_in_worker(extraction):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        calls.append("chunk")
-        return original_chunk(extraction)
-
-    def save_chunks_in_worker(record, directory):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        calls.append("save_chunks")
-        return original_save_chunks(record, directory)
-
-    monkeypatch.setattr(ingestion, "extract_pages", extract_in_worker)
-    monkeypatch.setattr(storage, "_save_document", save_pdf_in_worker)
-    monkeypatch.setattr(storage, "_save_extraction", save_in_worker)
-    monkeypatch.setattr(ingestion, "_chunk_extraction", chunk_in_worker)
-    monkeypatch.setattr(storage, "_save_chunks", save_chunks_in_worker)
-    response = client.post(
-        "/documents",
-        files={"file": ("sample.pdf", SAMPLE_PDF.read_bytes(), "application/pdf")},
-    )
-
-    assert response.status_code == 201
-    assert calls == ["pdf", "extract", "save", "chunk", "save_chunks"]
+    assert set(body) == {"document_id", "job_id", "status"}
+    assert body["status"] == "queued"
+    setup.assert_awaited_once_with(UUID(body["job_id"]))
+    assert not config.CHUNK_DIRECTORY.exists()
 
 
 @pytest.mark.parametrize(
-    ("case", "expected_status"),
+    ("filename", "contents", "media_type", "status"),
     [
-        ("success", None),
-        ("invalid_media_type", 415),
-        ("missing_filename", 422),
-        ("invalid_metadata", 422),
-        ("pdf_storage_failure", 500),
-        ("json_storage_failure", 500),
-        ("chunk_storage_failure", 500),
-        ("parse_failure", None),
+        ("notes.txt", b"notes", "text/plain", 415),
+        ("fake.pdf", b"fake", "application/pdf", 415),
+        ("../fake.pdf", b"%PDF-1.4", "application/pdf", 422),
+        ("big.pdf", b"%PDF-" + b"x" * MAX_DOCUMENT_SIZE_BYTES, "application/pdf", 413),
     ],
+    ids=["media-type", "signature", "filename", "oversize"],
 )
-def test_endpoint_closes_upload_on_success_and_handled_failures(
-    case: str,
-    expected_status: int | None,
-    storage_directory: Path,
-    extraction_directory: Path,
-    chunk_directory: Path,
-) -> None:
-    filename = "sample.pdf"
-    media_type = "application/pdf"
-    contents = SAMPLE_PDF.read_bytes()
-    if case == "invalid_media_type":
-        media_type = "text/plain"
-    elif case == "missing_filename":
-        filename = None
-    elif case == "invalid_metadata":
-        filename = "../sample.pdf"
-    elif case == "pdf_storage_failure":
-        storage_directory.write_bytes(b"not a directory")
-    elif case == "json_storage_failure":
-        extraction_directory.write_bytes(b"not a directory")
-    elif case == "chunk_storage_failure":
-        chunk_directory.write_bytes(b"not a directory")
-    elif case == "parse_failure":
-        contents = b"%PDF-1.4\nbroken\n"
-
-    source = BytesIO(contents)
-    upload = UploadFile(
-        file=source,
-        filename=filename,
-        headers=Headers({"content-type": media_type}),
+def test_invalid_upload_is_not_enqueued(setup, filename, contents, media_type, status):
+    response = TestClient(app).post(
+        "/documents", files={"file": (filename, contents, media_type)}
     )
-    # Call the handler directly: this proves its finally block closes the file,
-    # independently of FastAPI's own multipart cleanup.
-    if expected_status is None:
-        result = asyncio.run(main.upload_document(upload))
-        expected_extraction = "failed" if case == "parse_failure" else "completed"
-        assert result.extraction_status == expected_extraction
-    else:
-        with pytest.raises(HTTPException) as exc:
-            asyncio.run(main.upload_document(upload))
-        assert exc.value.status_code == expected_status
-
-    assert source.closed
-    if case in {"invalid_media_type", "missing_filename", "invalid_metadata"}:
-        assert not storage_directory.exists()
-        assert not extraction_directory.exists()
+    assert response.status_code == status
+    setup.assert_not_awaited()
+    assert not config.STORAGE_DIRECTORY.exists()
 
 
-def test_endpoint_closes_upload_when_unexpected_error_propagates(monkeypatch) -> None:
-    error = RuntimeError("Unexpected failure")
-
-    def fail_extraction(path):
-        raise error
-
-    monkeypatch.setattr(ingestion, "extract_pages", fail_extraction)
-    source = BytesIO(SAMPLE_PDF.read_bytes())
-    upload = UploadFile(
-        file=source,
-        filename="sample.pdf",
-        headers=Headers({"content-type": "application/pdf"}),
-    )
-
-    with pytest.raises(RuntimeError) as exc:
-        asyncio.run(main.upload_document(upload))
-
-    assert exc.value is error
-    assert source.closed
-
-
-def test_internal_chunk_validation_failure_propagates_and_closes_upload(
-    monkeypatch: pytest.MonkeyPatch, extraction_directory: Path, chunk_directory: Path
-) -> None:
-    with pytest.raises(ValidationError) as invalid:
-        DocumentChunk(
-            document_id=UUID(int=1),
-            page_number=1,
-            chunk_index=0,
-            start_char=0,
-            end_char=5,
-            text="wrong length",
+@pytest.mark.parametrize("stage", ["pdf", "job", "queue"])
+def test_submission_failure_is_not_accepted(setup, monkeypatch, stage):
+    if stage == "pdf":
+        config.STORAGE_DIRECTORY.write_text("not a directory")
+    elif stage == "job":
+        monkeypatch.setattr(
+            ingestion,
+            "create_job",
+            AsyncMock(side_effect=sqlite3.OperationalError("private path")),
         )
-    error = invalid.value
+    else:
+        setup.side_effect = ConnectionError("private connection details")
+    response = TestClient(app).post(
+        "/documents", files={"file": ("sample.pdf", b"%PDF-1.4", "application/pdf")}
+    )
+    assert response.status_code == (503 if stage == "queue" else 500)
+    assert "private" not in response.text
+    if stage != "queue":
+        setup.assert_not_awaited()
+    if stage == "queue":
+        job_id = setup.await_args.args[0]
+        job = asyncio.run(load_job(job_id, config.JOB_DATABASE_PATH))
+        assert job.status == "queued"
+        assert (config.STORAGE_DIRECTORY / f"{job.document_id}.pdf").exists()
 
-    def fail_chunk(extraction):
-        raise error
 
-    monkeypatch.setattr(ingestion, "_chunk_extraction", fail_chunk)
-    source = BytesIO(SAMPLE_PDF.read_bytes())
+@pytest.mark.parametrize("failure", [False, True])
+def test_upload_is_closed(setup, failure):
+    if failure:
+        setup.side_effect = ConnectionError("unavailable")
+    source = BytesIO(b"%PDF-1.4")
     upload = UploadFile(
         file=source,
         filename="sample.pdf",
         headers=Headers({"content-type": "application/pdf"}),
     )
+    if failure:
+        from fastapi import HTTPException
 
-    with pytest.raises(ValidationError) as propagated:
-        asyncio.run(main.upload_document(upload))
-
-    assert propagated.value is error
+        with pytest.raises(HTTPException):
+            asyncio.run(upload_document(upload))
+    else:
+        asyncio.run(upload_document(upload))
     assert source.closed
-    assert len(list(extraction_directory.iterdir())) == 1
-    assert not chunk_directory.exists()

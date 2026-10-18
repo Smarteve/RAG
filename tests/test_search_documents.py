@@ -2,7 +2,7 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -315,45 +315,29 @@ def test_internal_ranking_errors_are_logged_and_return_server_errors(
     assert "Could not search document" in caplog.text
 
 
-def test_blank_upload_is_searchable_but_has_no_hits() -> None:
+def test_blank_upload_is_searchable_but_has_no_hits(prepare_document) -> None:
     with BytesIO() as output, PdfWriter() as writer:
         writer.add_blank_page(width=595, height=842)
         writer.write(output)
         contents = output.getvalue()
-    upload = client.post(
-        "/documents", files={"file": ("blank.pdf", contents, "application/pdf")}
-    )
-    assert upload.status_code == 201
+    document_id = prepare_document(contents)
 
-    response = client.get(
-        f"/documents/{upload.json()['document_id']}/search", params={"query": "leave"}
-    )
+    response = client.get(f"/documents/{document_id}/search", params={"query": "leave"})
 
     assert response.status_code == 200
     assert response.json()["hits"] == []
 
 
-def test_failed_extraction_is_not_searchable() -> None:
-    upload = client.post(
-        "/documents",
-        files={"file": ("broken.pdf", b"%PDF-1.4\nbroken", "application/pdf")},
-    )
-    assert upload.status_code == 201
+def test_failed_extraction_is_not_searchable(prepare_document) -> None:
+    document_id = prepare_document(b"%PDF-1.4\nbroken")
 
-    response = client.get(
-        f"/documents/{upload.json()['document_id']}/search", params={"query": "leave"}
-    )
+    response = client.get(f"/documents/{document_id}/search", params={"query": "leave"})
 
     assert response.status_code == 409
 
 
-def test_upload_then_search_returns_exact_source_passages() -> None:
-    upload = client.post(
-        "/documents",
-        files={"file": ("handbook.pdf", SAMPLE_PDF.read_bytes(), "application/pdf")},
-    )
-    assert upload.status_code == 201
-    document_id = UUID(upload.json()["document_id"])
+def test_upload_then_search_returns_exact_source_passages(prepare_document) -> None:
+    document_id = prepare_document(SAMPLE_PDF.read_bytes())
 
     response = client.get(
         f"/documents/{document_id}/search", params={"query": "annual leave", "limit": 5}

@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 
+REDIS_URL = os.environ.get("NEXUSRAG_REDIS_URL", "redis://localhost:6379/0")
+INGESTION_QUEUE_NAME = os.environ.get("NEXUSRAG_INGESTION_QUEUE_NAME", "ingestion")
+
 JOB_DATABASE_PATH = (
     Path(os.environ.get("NEXUSRAG_JOB_DATABASE_PATH", "data/jobs.sqlite3"))
     .expanduser()
