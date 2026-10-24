@@ -49,29 +49,90 @@ Linux dependencies only; macOS and Windows are not supported by this setup.
 `uv sync` installs the pinned interpreter if needed and creates `.venv`.
 CI and Docker use the same Python version.
 
+### Start Redis, the worker, and the API
+
+Run these commands from the project root. Redis runs in Docker; the Python API
+and RQ worker run locally in separate terminals.
+
+Before the first run, install the optional processing/generation dependencies:
+
 ```bash
-uv run uvicorn nexusrag.main:app --reload
+uv sync --locked --extra embeddings --extra generation
 ```
 
-Then open <http://127.0.0.1:8000/docs>.
+Cache MiniLM using the instructions under [Try local MiniLM embeddings](#try-local-minilm-embeddings).
+For `/ask`, put `GROQ_API_KEY` in your local `.env` as described under
+[Ask a question and receive an answer](#ask-a-question-and-receive-an-answer).
+Document processing itself does not call Groq.
+
+1. Start the Redis container in the background:
+
+   ```bash
+   docker compose up -d redis
+   docker compose ps
+   docker compose exec redis redis-cli ping
+   ```
+
+   Expect `PONG`. If Redis is already healthy, leave it running.
+
+2. Start the worker in terminal 1 and leave it running:
+
+   ```bash
+   uv run --no-sync python -m nexusrag.run_worker
+   ```
+
+   This creates an RQ worker, initializes SQLite, and registers our exception
+   and killed-workhorse hooks. It listens for tasks on the configured queue;
+   you do not restart it for each upload. Use this command instead of a plain
+   `rq worker` command so the application hooks are registered.
+
+3. Start the API in terminal 2 and leave it running:
+
+   ```bash
+   uv run --env-file .env --no-sync uvicorn nexusrag.main:app --reload
+   ```
+
+   If you only want to upload/process documents and do not have a `.env`, omit
+   `--env-file .env`. `--no-sync` preserves the extras installed above.
+
+4. Open <http://127.0.0.1:8000/docs> and try the flow:
+
+   - Execute `POST /documents` with `examples/employee-handbook.pdf`.
+   - Copy `job_id` and `document_id` from **Server response → Response body**,
+     not the static **Example Value**.
+   - Execute `GET /jobs/{job_id}` repeatedly until `succeeded` or `failed`.
+     A successful job moves through `queued → running → succeeded`.
+   - Once it succeeds, execute `POST /documents/{document_id}/ask` with a question.
+     Use the document ID for `/ask`, and the job ID for status checks.
+   - If processing fails, inspect the worker terminal. Asking while queued,
+     running, or failed returns `409` with the job ID and status.
+
+The worker and API can start in either order after Redis; both must be running
+for the complete upload-to-answer flow. If the worker is stopped, accepted jobs
+remain queued until a worker consumes them.
+
+Stop the API and worker with Ctrl+C in their terminals. Stop Redis with:
+
+```bash
+docker compose down
+```
+
+The named `redis_data` volume retains Redis persistence files. Avoid
+`docker compose down -v` unless you intend to delete those files. Redis uses AOF
+with once-per-second syncing; a sudden crash can lose recent writes.
+
+### Queue behavior and storage
 
 `POST /documents` validates and saves the PDF, records a queued job in SQLite,
 and submits its ID to RQ through Redis. It returns `202 Accepted` with
 `document_id`, `job_id`, and `status: "queued"`. Acceptance does not mean the
-PDF has been extracted or indexed. A separate worker performs that work.
-
-Start Redis with `docker compose up -d redis`. Initialize the API by running
-the Uvicorn command above, then start a worker from the same project directory:
-
-```bash
-uv run rq worker --url redis://localhost:6379/0 --serializer json ingestion
-```
+PDF has been extracted or indexed. The worker executes `nexusrag.tasks.process_document`.
 
 The API and worker must share the configured database, source directories, and
 cached local embedding model. Defaults use `data/jobs.sqlite3`, queue `ingestion`,
 and Redis at `redis://localhost:6379/0`. Environment overrides are
 `NEXUSRAG_JOB_DATABASE_PATH`, `NEXUSRAG_INGESTION_QUEUE_NAME`, and
-`NEXUSRAG_REDIS_URL`. Pass matching queue/URL options to the worker CLI.
+`NEXUSRAG_REDIS_URL`. The worker startup command reads these settings too.
 
 PDF or job persistence failure returns `500`; unconfirmed queue acceptance
 returns `503`. Source PDFs and queued records are retained after enqueue errors
@@ -85,6 +146,16 @@ upload to check progress. It returns the job/document IDs, status (`queued`,
 safe error. Unknown IDs return `404`, invalid UUIDs return `422`, and corrupt
 records or database failures return a generic `500`. Ask questions after the
 job reaches `succeeded`.
+
+Worker failure hooks are registered by `python -m nexusrag.run_worker`. They
+record safe failures for Python exceptions and unexpected workhorse termination,
+only when SQLite still says running. Queued and terminal records remain unchanged.
+Rejected claims do not fail a different execution. SQLite recovery errors are
+logged without exception details and do not block RQ's normal failure handling.
+A plain `rq worker` command does not register these application hooks. Whole-worker
+or machine loss still needs periodic reconciliation, which is not implemented.
+Automatic retries remain disabled; execution ownership for retries must be
+specified before enabling them.
 
 The same UUID links the original and extracted data:
 
@@ -124,7 +195,7 @@ it does not guarantee durability across power loss.
 Worker processing failures retain the source PDF and mark the job `failed`
 with a safe public error. Partial extraction/chunk artifacts may remain, but
 success is recorded only after indexing finishes. Each index JSON is published
-atomically. Automatic retries and interrupted-job recovery are not implemented.
+atomically. Automatic retries and whole-worker interruption recovery are not implemented.
 Upload metadata is validated but is not persisted or returned. OCR is not
 implemented. `/ask` checks the document processing job before retrieval. Queued, running,
 and failed jobs return `409` with a safe message, job ID, and status. Successful

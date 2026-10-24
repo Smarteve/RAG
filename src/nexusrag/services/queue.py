@@ -23,7 +23,7 @@ queue = Queue(
 async def enqueue_processing(job_id: UUID) -> None:
     await run_in_threadpool(
         queue.enqueue_call,
-        "nexusrag.worker.process_document",
+        "nexusrag.tasks.process_document",
         args=(str(job_id),),
         job_id=str(job_id),
     )

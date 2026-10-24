@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from nexusrag import worker
+from nexusrag import tasks
 from nexusrag.schemas.job import ProcessingJob
 
 
@@ -21,39 +21,41 @@ def workflow(
         created_at=now,
         updated_at=now,
     )
-    monkeypatch.setattr(worker, "load_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(tasks, "load_job", AsyncMock(return_value=job))
     transition = AsyncMock()
-    monkeypatch.setattr(worker, "transition_job", transition)
+    monkeypatch.setattr(tasks, "transition_job", transition)
     process = AsyncMock(return_value=[])
-    monkeypatch.setattr(worker, "run_in_threadpool", process)
-    monkeypatch.setattr(worker, "save_extraction", AsyncMock())
-    monkeypatch.setattr(worker, "save_chunks", AsyncMock())
+    monkeypatch.setattr(tasks, "run_in_threadpool", process)
+    monkeypatch.setattr(tasks, "save_extraction", AsyncMock())
+    monkeypatch.setattr(tasks, "save_chunks", AsyncMock())
     runtime = Mock()
     runtime.use_embedder.return_value.__aenter__ = AsyncMock(return_value=Mock())
     runtime.use_embedder.return_value.__aexit__ = AsyncMock(return_value=False)
-    monkeypatch.setattr(worker, "EmbeddingRuntime", Mock(return_value=runtime))
-    monkeypatch.setattr(worker, "build_semantic_index", AsyncMock())
+    monkeypatch.setattr(tasks, "EmbeddingRuntime", Mock(return_value=runtime))
+    monkeypatch.setattr(tasks, "build_semantic_index", AsyncMock())
     return job, transition, process
 
 
 def test_success_marks_ready_after_indexing(workflow) -> None:
     job, transition, _ = workflow
-    asyncio.run(worker._process_document(job.job_id))
+    asyncio.run(tasks._process_document(job.job_id))
     assert [call.args[1] for call in transition.await_args_list] == [
         "running",
         "succeeded",
     ]
-    worker.save_extraction.assert_awaited_once()
-    worker.save_chunks.assert_awaited_once()
-    worker.build_semantic_index.assert_awaited_once()
-    assert worker.build_semantic_index.await_args.args[0] == job.document_id
+    tasks.save_extraction.assert_awaited_once()
+    tasks.save_chunks.assert_awaited_once()
+    tasks.build_semantic_index.assert_awaited_once()
+    assert tasks.build_semantic_index.await_args.args[0] == job.document_id
 
 
 def test_claim_failure_does_not_process_or_fail_job(workflow) -> None:
     job, transition, process = workflow
     transition.side_effect = ValueError("Invalid job transition")
-    with pytest.raises(ValueError, match="Invalid job transition"):
-        asyncio.run(worker._process_document(job.job_id))
+    with pytest.raises(
+        tasks.JobNotClaimedError, match="Could not claim processing job"
+    ):
+        asyncio.run(tasks._process_document(job.job_id))
     assert transition.await_count == 1
     process.assert_not_awaited()
 
@@ -65,9 +67,9 @@ def test_claim_failure_does_not_process_or_fail_job(workflow) -> None:
 def test_processing_failure_is_recorded_and_reraised(workflow, stage: str) -> None:
     job, transition, _ = workflow
     error = RuntimeError("private provider/path detail")
-    getattr(worker, stage).side_effect = error
+    getattr(tasks, stage).side_effect = error
     with pytest.raises(RuntimeError) as caught:
-        asyncio.run(worker._process_document(job.job_id))
+        asyncio.run(tasks._process_document(job.job_id))
     assert caught.value is error
     assert [call.args[1] for call in transition.await_args_list] == [
         "running",
@@ -80,7 +82,7 @@ def test_success_write_failure_does_not_mark_processing_failed(workflow) -> None
     job, transition, _ = workflow
     transition.side_effect = [None, OSError("Database unavailable")]
     with pytest.raises(OSError, match="Database unavailable"):
-        asyncio.run(worker._process_document(job.job_id))
+        asyncio.run(tasks._process_document(job.job_id))
     assert [call.args[1] for call in transition.await_args_list] == [
         "running",
         "succeeded",
