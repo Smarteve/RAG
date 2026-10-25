@@ -153,7 +153,8 @@ only when SQLite still says running. Queued and terminal records remain unchange
 Rejected claims do not fail a different execution. SQLite recovery errors are
 logged without exception details and do not block RQ's normal failure handling.
 A plain `rq worker` command does not register these application hooks. Whole-worker
-or machine loss still needs periodic reconciliation, which is not implemented.
+or machine loss needs the reconciliation pass described below; periodic scheduling
+is not implemented.
 Automatic retries remain disabled; execution ownership for retries must be
 specified before enabling them.
 
@@ -592,3 +593,48 @@ consistent with the committed lockfile.
 CI uses only base/dev dependencies and fake inference adapters: it needs no
 Groq key, generation SDK, model download, or external inference request.
 After the minimal CI sync above, reinstall both extras before a real /ask demo.
+
+
+### Inspect and recover interrupted jobs
+
+`inspect_running_jobs(database_path, redis_url)` performs one read-only pass.
+Interrupted candidates have `recovery_action="skipped"` in dry runs. Pass
+`apply_recovery=True` to mark confirmed interrupted jobs failed. It does not
+create retries or schedule repeated sweeps.
+
+Apply mode first acquires a nonblocking document lock, rechecks RQ, then compares
+the complete SQLite job snapshot inside a write transaction. Only RQ failed/stopped
+jobs with no execution records qualify. Locked documents, stale/missing heartbeats,
+missing RQ records, Redis outages, and changed job records are left unchanged.
+The result reports `recovery_action` as `none`, `skipped`, or `failed`.
+
+Restart all workers with `uv run --no-sync python -m nexusrag.run_worker` before
+using apply mode: older workers do not participate in document locking. Task
+entry points hold `.job-locks/<document_id>.lock` beside the configured database
+through processing and publication. Recovery uses the same lock. A paused or
+orphaned child keeps ownership; process death releases it. Do not delete lock
+files while processes may be using them. This exclusion relies on the current
+shared local Linux filesystem and is not a distributed lease mechanism.
+
+
+### Explicit retries
+
+`services/job_retry.py` provides `retry_failed_job(job_id, database_path,
+max_attempts)`. It creates a new queued job for the existing PDF and enqueues
+its new ID. `max_attempts` counts the initial attempt too. Retry policy currently
+allows only `Document processing was interrupted`; generic failures require
+investigation. Automatic RQ retries and a retry HTTP endpoint are not enabled.
+
+Retry creation acquires the document lock and validates the latest attempt in
+one SQLite transaction. Unique indexes prevent duplicate retry parents, attempt
+numbers, and active attempts for a document. Startup adds these indexes to
+existing databases; conflicting old records require correction before startup
+can complete. Prior attempts remain unchanged. `/ask` follows the latest attempt
+of a validated chain, so a queued retry returns `409` until it succeeds.
+
+If queue acceptance cannot be confirmed, `RetrySubmissionError.job_id` identifies
+the retained queued attempt. A repeated request for its parent raises
+`RetryAlreadyExistsError` with the later job ID; it does not enqueue it again.
+Queued-delivery reconciliation remains follow-up work. Transactional recovery
+helpers now live in `job_storage.py`; `reconciliation.py` inspects and recovers
+running jobs, while `job_retry.py` owns retry policy and submission.

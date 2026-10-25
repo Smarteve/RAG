@@ -1,4 +1,5 @@
 import sqlite3
+from itertools import pairwise
 from pathlib import Path
 from uuid import UUID
 
@@ -121,23 +122,84 @@ async def load_document_job(
     return await run_in_threadpool(_load_document_job, document_id, database_path)
 
 
-def _load_document_job(document_id: UUID, database_path: Path) -> ProcessingJob | None:
-    connection = sqlite3.connect(database_path)
-    try:
-        rows = connection.execute(
-            "SELECT job_id, record FROM processing_jobs "
-            "WHERE json_extract(record, '$.document_id') = ?",
-            (str(document_id),),
-        ).fetchall()
-        if not rows:
-            return None
-        # Multiple attempts need an explicit retry policy, not arbitrary selection.
-        if len(rows) != 1:
-            raise ValueError("Multiple processing jobs for document")
-        stored_id, record = rows[0]
+def _document_jobs(
+    connection: sqlite3.Connection, document_id: UUID
+) -> list[ProcessingJob]:
+    rows = connection.execute(
+        "SELECT job_id, record FROM processing_jobs "
+        "WHERE json_extract(record, '$.document_id') = ?",
+        (str(document_id),),
+    ).fetchall()
+    jobs = []
+    for stored_id, record in rows:
         job = ProcessingJob.model_validate_json(record)
         if str(job.job_id) != stored_id or job.document_id != document_id:
             raise ValueError("Stored job identity mismatch")
-        return job
+        jobs.append(job)
+    return jobs
+
+
+def _latest_attempt(jobs: list[ProcessingJob]) -> ProcessingJob | None:
+    if not jobs:
+        return None
+    ordered = sorted(jobs, key=lambda job: job.attempt_number)
+    root = ordered[0]
+    if root.attempt_number != 1 or any(
+        job.root_job_id != root.job_id for job in ordered
+    ):
+        raise ValueError("Invalid or ambiguous retry chain")
+    for previous, current in pairwise(ordered):
+        if (
+            current.attempt_number != previous.attempt_number + 1
+            or current.previous_job_id != previous.job_id
+            or previous.status != "failed"
+        ):
+            raise ValueError("Invalid or ambiguous retry chain")
+    return ordered[-1]
+
+
+def _load_document_job(document_id: UUID, database_path: Path) -> ProcessingJob | None:
+    connection = sqlite3.connect(database_path)
+    try:
+        return _latest_attempt(_document_jobs(connection, document_id))
+    finally:
+        connection.close()
+
+
+async def fail_running_job(job_id: UUID, database_path: Path, error: str) -> bool:
+    """Fail a running job atomically; preserve queued and terminal records."""
+    return await run_in_threadpool(_fail_running_job, job_id, database_path, error)
+
+
+def _fail_running_job(
+    job_id: UUID,
+    database_path: Path,
+    error: str,
+    *,
+    expected_job: ProcessingJob | None = None,
+) -> bool:
+    connection = sqlite3.connect(database_path)
+    try:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT record FROM processing_jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError("Job not found")
+            current = ProcessingJob.model_validate_json(row[0])
+            if current.job_id != job_id:
+                raise ValueError("Stored job ID does not match requested job")
+            if expected_job is not None and current != expected_job:
+                return False
+            if current.status != "running":
+                return False
+            updated = job_transition(current, "failed", error)
+            connection.execute(
+                "UPDATE processing_jobs SET record = ? WHERE job_id = ?",
+                (updated.model_dump_json(), str(job_id)),
+            )
+        return True
     finally:
         connection.close()

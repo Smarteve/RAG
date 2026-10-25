@@ -87,3 +87,27 @@ def test_success_write_failure_does_not_mark_processing_failed(workflow) -> None
         "running",
         "succeeded",
     ]
+
+
+def test_task_entry_point_holds_lock_through_work(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from nexusrag.services.processing_lock import DocumentBusyError, document_lock
+
+    job_id, document_id = uuid4(), uuid4()
+    path = tmp_path / "jobs.sqlite3"
+    monkeypatch.setattr(tasks.config, "JOB_DATABASE_PATH", path)
+    monkeypatch.setattr(
+        tasks, "_load_job", Mock(return_value=SimpleNamespace(document_id=document_id))
+    )
+
+    async def process(identifier):
+        assert identifier == job_id
+        with pytest.raises(DocumentBusyError), document_lock(document_id, path):
+            pytest.fail("Task did not hold lock")
+
+    monkeypatch.setattr(tasks, "_process_document", process)
+    tasks.process_document(str(job_id))
+    with document_lock(document_id, path), pytest.raises(tasks.JobNotClaimedError):
+        tasks.process_document(str(job_id))

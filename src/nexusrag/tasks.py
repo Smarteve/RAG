@@ -17,7 +17,8 @@ from nexusrag.services.chunking import chunk_document
 from nexusrag.services.embedding_runtime import EmbeddingRuntime
 from nexusrag.services.extraction import extract_pages
 from nexusrag.services.indexing import build_semantic_index
-from nexusrag.services.job_storage import load_job, transition_job
+from nexusrag.services.job_storage import _load_job, load_job, transition_job
+from nexusrag.services.processing_lock import DocumentBusyError, document_lock
 from nexusrag.storage import save_chunks, save_extraction
 
 
@@ -26,7 +27,18 @@ class JobNotClaimedError(RuntimeError):
 
 
 def process_document(job_id: str) -> None:
-    asyncio.run(_process_document(UUID(job_id)))
+    identifier = UUID(job_id)
+    try:
+        job = _load_job(identifier, config.JOB_DATABASE_PATH)
+    except Exception as error:
+        raise JobNotClaimedError("Could not load processing job") from error
+    try:
+        # Hold through artifact writes and final status. A paused/orphaned child
+        # retains this lock, preventing recovery from revoking live ownership.
+        with document_lock(job.document_id, config.JOB_DATABASE_PATH):
+            asyncio.run(_process_document(identifier))
+    except DocumentBusyError as error:
+        raise JobNotClaimedError("Document is already being processed") from error
 
 
 async def _process_document(job_id: UUID) -> None:

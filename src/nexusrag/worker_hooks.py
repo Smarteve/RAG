@@ -10,7 +10,7 @@ from uuid import UUID
 from rq.job import Job
 
 from nexusrag import config
-from nexusrag.services.job_recovery import fail_running_job
+from nexusrag.services.job_storage import fail_running_job
 from nexusrag.tasks import JobNotClaimedError
 
 logger = logging.getLogger(__name__)

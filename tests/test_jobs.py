@@ -141,3 +141,59 @@ def test_transition_validates_error_without_mutating_original(
         job_transition(original, new_status, error)
 
     assert original.model_dump() == snapshot
+
+
+def test_original_and_legacy_jobs_default_to_first_attempt() -> None:
+    job = make_job()
+    assert job.root_job_id == job.job_id
+    assert job.previous_job_id is None
+    assert job.attempt_number == 1
+    legacy = job.model_dump(
+        exclude={"root_job_id", "previous_job_id", "attempt_number"}
+    )
+    assert ProcessingJob.model_validate(legacy) == job
+
+
+@pytest.mark.parametrize("status", STATUSES)
+def test_retry_metadata_survives_json_round_trip(status: JobStatus) -> None:
+    root = uuid4()
+    job = make_job(status, root_job_id=root, previous_job_id=root, attempt_number=2)
+    assert ProcessingJob.model_validate_json(job.model_dump_json()) == job
+
+
+def test_transition_preserves_retry_metadata() -> None:
+    root = uuid4()
+    job = make_job(root_job_id=root, previous_job_id=root, attempt_number=2)
+    updated = job_transition(job, "running")
+    assert updated.root_job_id == root
+    assert updated.previous_job_id == root
+    assert updated.attempt_number == 2
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attempt_number": 0},
+        {"attempt_number": -1},
+        {"attempt_number": True},
+        {"attempt_number": 1.5},
+        {"attempt_number": "2"},
+        {"root_job_id": uuid4()},
+        {"previous_job_id": uuid4()},
+        {"attempt_number": 2},
+        {"attempt_number": 2, "root_job_id": uuid4()},
+        {"root_job_id": "invalid"},
+        {"previous_job_id": "invalid"},
+    ],
+)
+def test_invalid_retry_metadata_is_rejected(overrides) -> None:
+    with pytest.raises(ValidationError):
+        make_job(**overrides)
+
+
+def test_retry_cannot_reference_itself_as_previous_job() -> None:
+    job_id = uuid4()
+    with pytest.raises(ValidationError, match="different previous job"):
+        make_job(
+            job_id=job_id, root_job_id=uuid4(), previous_job_id=job_id, attempt_number=2
+        )

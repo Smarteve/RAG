@@ -25,6 +25,9 @@ def job_transition(
         created_at=current_job.created_at,
         updated_at=datetime.now(UTC),
         error=error,
+        root_job_id=current_job.root_job_id,
+        previous_job_id=current_job.previous_job_id,
+        attempt_number=current_job.attempt_number,
     )
 
     return new_job

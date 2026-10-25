@@ -11,8 +11,12 @@ from pydantic import ValidationError
 from nexusrag import config, run_worker, worker_hooks
 from nexusrag.database import initialize_database
 from nexusrag.schemas.job import ProcessingJob
-from nexusrag.services.job_recovery import fail_running_job
-from nexusrag.services.job_storage import create_job, load_job, transition_job
+from nexusrag.services.job_storage import (
+    create_job,
+    fail_running_job,
+    load_job,
+    transition_job,
+)
 from nexusrag.tasks import JobNotClaimedError
 
 
