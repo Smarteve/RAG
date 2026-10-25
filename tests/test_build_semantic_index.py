@@ -319,3 +319,68 @@ def test_encoding_is_offloaded_from_request_event_loop(
     assert request_threads
     assert worker_threads
     assert set(worker_threads).isdisjoint(request_threads)
+
+
+def test_manual_indexing_respects_processing_lock(client, loader):
+    from nexusrag.services.processing_lock import document_lock
+
+    chunks = save_source()
+    with document_lock(chunks.document_id, config.JOB_DATABASE_PATH):
+        response = client.post(f"/documents/{chunks.document_id}/semantic-index")
+    assert response.status_code == 409
+    loader.assert_not_called()
+    assert (
+        client.post(f"/documents/{chunks.document_id}/semantic-index").status_code
+        == 200
+    )
+
+
+def test_manual_indexing_holds_lock_through_publish(client, monkeypatch):
+    from nexusrag.services.processing_lock import DocumentBusyError, document_lock
+
+    chunks = save_source()
+    original = main.indexing.build_semantic_index
+
+    async def build(*args, **kwargs):
+        with (
+            pytest.raises(DocumentBusyError),
+            document_lock(chunks.document_id, config.JOB_DATABASE_PATH),
+        ):
+            pytest.fail("Reindexing did not hold document lock")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(main.indexing, "build_semantic_index", build)
+    assert (
+        client.post(f"/documents/{chunks.document_id}/semantic-index").status_code
+        == 200
+    )
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "failed"])
+def test_manual_indexing_rejects_unfinished_jobs(client, loader, status):
+    from datetime import UTC, datetime
+
+    from nexusrag.schemas.job import ProcessingJob
+    from nexusrag.services.job_storage import create_job, transition_job
+
+    chunks = save_source()
+    now = datetime.now(UTC)
+    job = ProcessingJob(
+        job_id=uuid4(),
+        document_id=chunks.document_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+    )
+    asyncio.run(create_job(job, config.JOB_DATABASE_PATH))
+    if status != "queued":
+        asyncio.run(transition_job(job.job_id, "running", config.JOB_DATABASE_PATH))
+    if status == "failed":
+        asyncio.run(
+            transition_job(
+                job.job_id, "failed", config.JOB_DATABASE_PATH, "Processing failed"
+            )
+        )
+    response = client.post(f"/documents/{chunks.document_id}/semantic-index")
+    assert response.status_code == 409
+    loader.assert_not_called()

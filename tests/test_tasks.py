@@ -109,5 +109,3 @@ def test_task_entry_point_holds_lock_through_work(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tasks, "_process_document", process)
     tasks.process_document(str(job_id))
-    with document_lock(document_id, path), pytest.raises(tasks.JobNotClaimedError):
-        tasks.process_document(str(job_id))

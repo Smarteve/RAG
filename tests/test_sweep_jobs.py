@@ -31,6 +31,7 @@ def sweep(monkeypatch):
     inspect = AsyncMock(return_value=[])
     candidates = AsyncMock(return_value=jobs)
     retry = AsyncMock(side_effect=jobs)
+    monkeypatch.setattr(sweep_jobs, "reconcile_queued_jobs", AsyncMock(return_value=[]))
     monkeypatch.setattr(sweep_jobs, "inspect_running_jobs", inspect)
     monkeypatch.setattr(sweep_jobs, "load_retry_candidates", candidates)
     monkeypatch.setattr(sweep_jobs, "retry_failed_job", retry)
@@ -128,3 +129,45 @@ def test_cli_passes_options(monkeypatch):
     monkeypatch.setattr("sys.argv", ["sweep_jobs", "--apply", "--max-attempts", "2"])
     assert sweep_jobs.main() == 1
     run.assert_awaited_once_with(apply=True, max_attempts=2)
+
+
+def test_sweep_reports_delivery_reconciliation(sweep, monkeypatch, capsys):
+    from nexusrag.schemas.recovery import DeliveryDecision
+
+    jobs, _, candidates, _ = sweep
+    candidates.return_value = []
+    reconcile = AsyncMock(
+        return_value=[
+            DeliveryDecision(
+                job_id=jobs[0].job_id, action="enqueued", reason="Delivered"
+            )
+        ]
+    )
+    monkeypatch.setattr(sweep_jobs, "reconcile_queued_jobs", reconcile)
+    assert asyncio.run(sweep_jobs.sweep_once(apply=True)) == 0
+    assert reconcile.await_args.kwargs["apply"] is True
+    output = events(capsys)
+    assert output[0]["event"] == "delivery"
+    assert output[-1]["redelivered"] == 1
+
+
+def test_sweep_returns_nonzero_for_uncertain_delivery(sweep, monkeypatch, capsys):
+    from nexusrag.schemas.recovery import DeliveryDecision
+
+    jobs, _, candidates, _ = sweep
+    candidates.return_value = []
+    monkeypatch.setattr(
+        sweep_jobs,
+        "reconcile_queued_jobs",
+        AsyncMock(
+            return_value=[
+                DeliveryDecision(
+                    job_id=jobs[0].job_id,
+                    action="uncertain",
+                    reason="Backend unavailable",
+                )
+            ]
+        ),
+    )
+    assert asyncio.run(sweep_jobs.sweep_once(apply=True)) == 1
+    assert events(capsys)[-1]["failures"] == 1

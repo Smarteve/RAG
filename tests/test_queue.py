@@ -11,5 +11,8 @@ def test_enqueue_passes_importable_task_and_string_id(monkeypatch):
     job_id = uuid4()
     asyncio.run(queue.enqueue_processing(job_id))
     enqueue.assert_called_once_with(
-        "nexusrag.tasks.process_document", args=(str(job_id),), job_id=str(job_id)
+        "nexusrag.tasks.process_document",
+        args=(str(job_id),),
+        job_id=str(job_id),
+        unique=True,
     )

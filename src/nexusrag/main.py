@@ -11,7 +11,11 @@ from pydantic import BaseModel
 
 from nexusrag import config
 from nexusrag.database import initialize_database
-from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
+from nexusrag.dependencies import (
+    get_answer_generator,
+    get_embedding_runtime,
+    require_reindex_lock,
+)
 from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
 from nexusrag.schemas.chunk import FetchChunksResponse
 from nexusrag.schemas.document import QueuedUploadResponse
@@ -223,6 +227,7 @@ async def search_document(
 async def build_document_semantic_index(
     document_id: UUID,
     runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
+    _lock: Annotated[None, Depends(require_reindex_lock)],
 ) -> SemanticIndexResponse:
     """Create or rebuild saved embeddings without returning vectors or paths."""
     # Validate source availability before loading an expensive optional model.

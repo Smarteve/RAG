@@ -147,3 +147,20 @@ def test_worker_startup_registers_hooks_and_json(monkeypatch):
     assert kwargs["work_horse_killed_handler"] is worker_hooks.handle_workhorse_killed
     worker.work.assert_called_once_with()
     connection.close.assert_called_once_with()
+
+
+def test_abandoned_execution_waits_for_guarded_reconciliation(job):
+    from rq.exceptions import AbandonedJobError
+
+    asyncio.run(transition_job(job.job_id, "running", config.JOB_DATABASE_PATH))
+    before = asyncio.run(load_job(job.job_id, config.JOB_DATABASE_PATH))
+    assert (
+        worker_hooks.handle_job_exception(
+            SimpleNamespace(id=str(job.job_id)),
+            AbandonedJobError,
+            AbandonedJobError(),
+            None,
+        )
+        is True
+    )
+    assert asyncio.run(load_job(job.job_id, config.JOB_DATABASE_PATH)) == before

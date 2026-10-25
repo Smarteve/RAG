@@ -35,7 +35,7 @@ def process_document(job_id: str) -> None:
     try:
         # Hold through artifact writes and final status. A paused/orphaned child
         # retains this lock, preventing recovery from revoking live ownership.
-        with document_lock(job.document_id, config.JOB_DATABASE_PATH):
+        with document_lock(job.document_id, config.JOB_DATABASE_PATH, blocking=True):
             asyncio.run(_process_document(identifier))
     except DocumentBusyError as error:
         raise JobNotClaimedError("Document is already being processed") from error

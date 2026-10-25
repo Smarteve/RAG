@@ -53,3 +53,24 @@ with document_lock(UUID(sys.argv[1]), Path(sys.argv[2])):
         if child.poll() is None:
             child.kill()
         child.communicate(timeout=5)
+
+
+def test_blocking_owner_waits_until_short_reconciliation_lock_releases(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    document_id = uuid4()
+    path = tmp_path / "jobs.sqlite3"
+    attempting = Event()
+
+    def wait_for_lock():
+        attempting.set()
+        with document_lock(document_id, path, blocking=True):
+            return True
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with document_lock(document_id, path):
+            future = pool.submit(wait_for_lock)
+            assert attempting.wait(timeout=5)
+            assert not future.done()
+        assert future.result(timeout=5) is True

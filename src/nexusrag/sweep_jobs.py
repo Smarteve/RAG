@@ -6,6 +6,7 @@ import json
 import sqlite3
 
 from nexusrag import config
+from nexusrag.services.delivery_reconciliation import reconcile_queued_jobs
 from nexusrag.services.job_retry import (
     RetryAlreadyExistsError,
     RetryLimitReachedError,
@@ -27,7 +28,7 @@ async def sweep_once(apply: bool = False, max_attempts: int = 3) -> int:
 
     Dry runs never create retries, enqueue tasks, or modify database records.
     Operational failures produce safe output and a nonzero exit code. Existing
-    queued attempts are not resubmitted; delivery reconciliation is separate.
+    queued attempts are redelivered with their original ID only when RQ is absent.
     """
     if type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
@@ -46,6 +47,20 @@ async def sweep_once(apply: bool = False, max_attempts: int = 3) -> int:
         return 1
     for decision in decisions:
         _report("inspection", **decision.model_dump(mode="json"))
+
+    try:
+        deliveries = await reconcile_queued_jobs(
+            config.JOB_DATABASE_PATH, config.REDIS_URL, apply=apply
+        )
+    except sqlite3.Error, OSError, ValueError:
+        _report(
+            "delivery_inspection_failed", reason="Could not inspect queued attempts"
+        )
+        return 1
+    for delivery in deliveries:
+        _report("delivery", **delivery.model_dump(mode="json"))
+        if delivery.action in {"uncertain", "delivery_unconfirmed"}:
+            failures += 1
 
     try:
         # Query again after recovery so this includes newly recovered jobs and
@@ -109,6 +124,8 @@ async def sweep_once(apply: bool = False, max_attempts: int = 3) -> int:
         "summary",
         apply=apply,
         recovered=sum(d.recovery_action == "failed" for d in decisions),
+        redelivered=sum(d.action == "enqueued" for d in deliveries),
+        proposed_deliveries=sum(d.action == "would_enqueue" for d in deliveries),
         retried=retried,
         proposed=proposed,
         skipped=skipped,

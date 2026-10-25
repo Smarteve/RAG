@@ -18,3 +18,18 @@ class RecoveryDecision(BaseModel):
     job_id: UUID
     decision: RecoveryDecisionStatus
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class DeliveryDecision(BaseModel):
+    """A queued-attempt delivery observation; no new processing attempt is made."""
+
+    job_id: UUID
+    action: Literal[
+        "present",
+        "would_enqueue",
+        "enqueued",
+        "skipped",
+        "uncertain",
+        "delivery_unconfirmed",
+    ]
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]

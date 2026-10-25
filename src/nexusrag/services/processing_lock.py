@@ -16,12 +16,16 @@ class DocumentBusyError(RuntimeError):
 
 
 @contextmanager
-def document_lock(document_id: UUID, database_path: Path) -> Iterator[None]:
+def document_lock(
+    document_id: UUID, database_path: Path, *, blocking: bool = False
+) -> Iterator[None]:
     directory = database_path.resolve().parent / ".job-locks"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / f"{document_id}.lock").open("a") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(
+                lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            )
         except BlockingIOError as error:
             raise DocumentBusyError("Document execution is still owned") from error
         try:

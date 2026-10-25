@@ -26,4 +26,5 @@ async def enqueue_processing(job_id: UUID) -> None:
         "nexusrag.tasks.process_document",
         args=(str(job_id),),
         job_id=str(job_id),
+        unique=True,
     )

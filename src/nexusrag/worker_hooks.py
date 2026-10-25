@@ -7,6 +7,7 @@ from resource import struct_rusage
 from types import TracebackType
 from uuid import UUID
 
+from rq.exceptions import AbandonedJobError
 from rq.job import Job
 
 from nexusrag import config
@@ -35,7 +36,9 @@ def handle_job_exception(
 ) -> bool:
     """Record failure without interrupting RQ's normal exception handlers."""
     # A duplicate execution rejected at claim time does not own the running job.
-    if not issubclass(exc_type, JobNotClaimedError):
+    # Abandonment can mean only the parent died, with a live orphan child.
+    # Let guarded reconciliation verify the document lock after RQ records it.
+    if not issubclass(exc_type, (JobNotClaimedError, AbandonedJobError)):
         _record_failure(job, "Document processing failed")
     return True
 

@@ -136,9 +136,9 @@ and Redis at `redis://localhost:6379/0`. Environment overrides are
 
 PDF or job persistence failure returns `500`; unconfirmed queue acceptance
 returns `503`. Source PDFs and queued records are retained after enqueue errors
-because delivery may have succeeded before a connection failed. There is no
-automatic reconciliation or submission deduplication yet; blindly retrying an
-upload may create another document.
+because delivery may have succeeded before a connection failed. The periodic sweep can reconcile queued attempts whose delivery is missing,
+using atomic RQ uniqueness for the same job ID. Upload requests themselves are
+not idempotent; blindly retrying an upload may create another document.
 
 Use `GET /jobs/{job_id}` (also available in `/docs`) with the ID returned by
 upload to check progress. It returns the job/document IDs, status (`queued`,
@@ -483,7 +483,7 @@ account-specific; upgrading billing changes the cost. See
 [Groq's limits](https://console.groq.com/docs/rate-limits).
 
 1. Upload a text-based PDF using POST `/documents`.
-2. Build its index using POST `/documents/{document_id}/semantic-index`.
+2. Poll `GET /jobs/{job_id}` until `succeeded`; the worker builds its index.
 3. In `/docs`, use POST `/documents/{document_id}/ask` with:
 
 ```json
@@ -635,7 +635,7 @@ of a validated chain, so a queued retry returns `409` until it succeeds.
 If queue acceptance cannot be confirmed, `RetrySubmissionError.job_id` identifies
 the retained queued attempt. A repeated request for its parent raises
 `RetryAlreadyExistsError` with the later job ID; it does not enqueue it again.
-Queued-delivery reconciliation remains follow-up work. Transactional recovery
+Queued-delivery reconciliation in the sweep can resubmit this same attempt safely. Transactional recovery
 helpers now live in `job_storage.py`; `reconciliation.py` inspects and recovers
 running jobs, while `job_retry.py` owns retry policy and submission.
 
@@ -662,7 +662,8 @@ retryability, and existing-child checks are revalidated before insertion. Dry ru
 do not simulate retries for running jobs that would first require recovery.
 
 Queue submission errors report the retained queued attempt ID. Existing queued
-attempts are never blindly re-enqueued; they still need delivery reconciliation.
+attempts are checked by delivery reconciliation and resubmitted only when RQ
+is absent, preserving the same job ID and attempt number.
 No timer or infinite loop is installed by this command. Schedule it only after
 manually verifying its decisions in this environment.
 
@@ -717,3 +718,68 @@ systemctl --user disable --now nexusrag-sweep.timer
 ```
 
 Disabling the timer does not interrupt a pass already running.
+
+
+### Queued delivery reconciliation
+
+Each sweep now inspects queued attempts after interrupted-job recovery and before
+creating retries. Attempts younger than 60 seconds are skipped to give the
+original upload/retry submission time to finish. Older queued attempts are
+redelivered only if the source PDF exists, SQLite still has the same current
+attempt, and RQ has no job record or residual queue entry. Existing queued,
+scheduled, or executing RQ tasks are not duplicated. Terminal mismatches, missing
+sources, inconsistent records, and Redis outages are reported for attention.
+
+Apply mode takes the document lock, repeats the checks, and submits the existing
+ID using RQ's atomic `unique=True` enqueue. All initial/retry submissions now use
+that same uniqueness mechanism. A lost acknowledgement leaves SQLite queued;
+the next pass observes the existing RQ task instead of creating another attempt.
+No attempt counter is incremented by delivery reconciliation. Dry run reports
+`would_enqueue`; apply reports `enqueued`, `present`, `skipped`, `uncertain`, or
+`delivery_unconfirmed`. Uncertain/unconfirmed delivery produces a nonzero sweep
+exit code and a safe diagnostic for operator review.
+
+Restart the API and all workers after updating: workers now wait on document
+locks so a task received during the short delivery lock is not rejected. Recovery
+and sweeps still acquire locks nonblocking. The existing systemd timer command
+runs this phase automatically; its unit files do not need to change.
+
+Optional integration tests use generated private queues and clean them afterward:
+
+```bash
+NEXUSRAG_TEST_REDIS_URL=redis://localhost:6379/0 uv run --no-sync pytest -q tests/test_delivery_redis.py
+```
+
+The default test suite skips these tests and remains offline.
+
+
+### Queue milestone validation and remaining limits
+
+Manual `POST /documents/{document_id}/semantic-index` uses the same document
+lock as task execution and recovery. It rejects queued/running/failed current
+attempts with `409` and holds the lock through publication. Existing documents
+without jobs retain source/index validation.
+
+RQ's default worker runs each task in a separate child. MiniLM loads once in
+that child and is released with it; reuse across tasks is deliberately deferred.
+Preloading a threaded ML runtime in a parent before forking needs separate design
+and measurement. This is a documented deviation from the original once-per-worker
+performance target, not a claim of model reuse.
+
+`AbandonedJobError` from RQ maintenance does not directly fail SQLite through the
+exception hook: a surviving orphan child might still hold the document lock.
+Guarded reconciliation decides after RQ records abandonment and the lock is free.
+
+A real, isolated crash/restart walkthrough can be run explicitly:
+
+```bash
+uv run --no-sync python -m examples.queue_restart_smoke
+```
+
+It requires Docker, the locally available `redis:8-alpine` image, embeddings
+extras, and the configured cached MiniLM. It creates and removes a private Redis
+container/volume, restarts that broker, kills a private RQ parent and child,
+waits about two minutes for actual abandonment/registry expiry, and runs recovery/retry to
+build real embeddings. It does not restart the application broker or call Groq.
+See `docs/queue-validation.md` for the recorded evidence and outstanding manual
+answer/CI checks.
