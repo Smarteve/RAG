@@ -638,3 +638,82 @@ the retained queued attempt. A repeated request for its parent raises
 Queued-delivery reconciliation remains follow-up work. Transactional recovery
 helpers now live in `job_storage.py`; `reconciliation.py` inspects and recovers
 running jobs, while `job_retry.py` owns retry policy and submission.
+
+### Run one recovery and retry sweep
+
+Start the API or worker once to initialize the database and indexes, and restart
+older workers so all executions participate in document locking. From the project
+root, preview a single pass:
+
+```bash
+uv run --no-sync python -m nexusrag.sweep_jobs
+```
+
+Apply guarded recovery and enqueue eligible failed attempts:
+
+```bash
+uv run --no-sync python -m nexusrag.sweep_jobs --apply --max-attempts 3
+```
+
+The command reports JSON lines for inspection, proposed/enqueued retries, skips,
+errors, and a summary. It exits nonzero on operational failures. It queries failed
+jobs after recovery, so earlier failures recorded by hooks are included. Limits,
+retryability, and existing-child checks are revalidated before insertion. Dry runs
+do not simulate retries for running jobs that would first require recovery.
+
+Queue submission errors report the retained queued attempt ID. Existing queued
+attempts are never blindly re-enqueued; they still need delivery reconciliation.
+No timer or infinite loop is installed by this command. Schedule it only after
+manually verifying its decisions in this environment.
+
+### Schedule the sweep with a user systemd timer
+
+The tracked service template and timer live in `deploy/systemd/`. The installer
+generates a service using this checkout's absolute path and the `uv` executable
+on your PATH, then links the timer into `~/.config/systemd/user/`. No personal
+paths need to be committed. The service uses default queue and storage settings;
+configure matching `NEXUSRAG_*` environment overrides if the API/worker use custom
+settings. It does not load shell startup files or `.env` automatically.
+
+After verifying a manual dry run and restarting workers with document locking,
+run from the project root:
+
+```bash
+uv run --no-sync python scripts/install_sweep.py
+systemctl --user enable --now nexusrag-sweep.timer
+```
+
+The installer reloads systemd but does not enable or restart the timer. It can
+migrate the old service symlink pointing into this checkout, regenerate its own
+output, and refuses to overwrite unrelated unit files. To preview generation in
+a temporary destination without contacting systemd:
+
+```bash
+uv run --no-sync python scripts/install_sweep.py --unit-dir /tmp/nexusrag-sweep-units --no-reload
+```
+
+The timer applies recovery and retries with a three-attempt limit. It first runs
+about one minute after activation, then one minute after each pass finishes.
+The same service is not started again while it is active. Redis and the RQ worker
+must be managed separately. This is a user-session timer, not a boot service.
+Keep the checkout available while the timer is enabled.
+
+Inspect the schedule and logs, or run one pass immediately:
+
+```bash
+systemctl --user list-timers nexusrag-sweep.timer
+journalctl --user -u nexusrag-sweep.service -n 50 --no-pager
+systemctl --user start nexusrag-sweep.service
+```
+
+After editing the service template or moving the checkout, rerun the installer.
+After changing the timer schedule, run `systemctl --user daemon-reload` and
+`systemctl --user restart nexusrag-sweep.timer`. Git updates do not automatically
+regenerate or reload units.
+To disable future sweeps:
+
+```bash
+systemctl --user disable --now nexusrag-sweep.timer
+```
+
+Disabling the timer does not interrupt a pass already running.

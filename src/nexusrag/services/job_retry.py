@@ -103,3 +103,44 @@ def _create_retry(
             return retry_job
         finally:
             connection.close()
+
+
+async def load_retry_candidates(
+    database_path: Path, max_attempts: int
+) -> list[ProcessingJob]:
+    """Return eligible latest failed attempts, including failures from hooks.
+
+    This is only a snapshot; retry_failed_job repeats eligibility checks under
+    the document lock and write transaction before creating an attempt.
+    """
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    return await run_in_threadpool(_load_retry_candidates, database_path, max_attempts)
+
+
+def _load_retry_candidates(
+    database_path: Path, max_attempts: int
+) -> list[ProcessingJob]:
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT job_id, record FROM processing_jobs"
+        ).fetchall()
+        documents: dict[UUID, list[ProcessingJob]] = {}
+        for stored_id, record in rows:
+            job = ProcessingJob.model_validate_json(record)
+            if str(job.job_id) != stored_id:
+                raise ValueError("Stored job identity mismatch")
+            documents.setdefault(job.document_id, []).append(job)
+        candidates = []
+        for jobs in documents.values():
+            latest = _latest_attempt(jobs)
+            if (
+                latest.status == "failed"
+                and latest.error == "Document processing was interrupted"
+                and latest.attempt_number < max_attempts
+            ):
+                candidates.append(latest)
+        return candidates
+    finally:
+        connection.close()

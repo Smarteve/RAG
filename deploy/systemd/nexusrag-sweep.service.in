@@ -1,0 +1,7 @@
+[Unit]
+Description=NexusRAG recovery and retry sweep
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@UV_PATH@ run --no-sync python -m nexusrag.sweep_jobs --apply --max-attempts 3

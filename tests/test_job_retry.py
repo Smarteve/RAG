@@ -189,3 +189,18 @@ def test_unknown_retry_job(failed):
     path, _ = failed
     with pytest.raises(FileNotFoundError):
         asyncio.run(retry_failed_job(uuid4(), path, 3, enqueue=AsyncMock()))
+
+
+def test_candidate_lookup_includes_hook_failure_and_excludes_existing_child(failed):
+    from nexusrag.services.job_retry import load_retry_candidates
+
+    path, job = failed
+    assert asyncio.run(load_retry_candidates(path, 3)) == [job]
+    assert asyncio.run(load_retry_candidates(path, 1)) == []
+    retry = asyncio.run(retry_failed_job(job.job_id, path, 3, enqueue=AsyncMock()))
+    assert asyncio.run(load_retry_candidates(path, 3)) == []
+    asyncio.run(transition_job(retry.job_id, "running", path))
+    asyncio.run(
+        transition_job(retry.job_id, "failed", path, "Document processing failed")
+    )
+    assert asyncio.run(load_retry_candidates(path, 3)) == []
