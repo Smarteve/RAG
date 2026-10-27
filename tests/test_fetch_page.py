@@ -12,6 +12,7 @@ from nexusrag.schemas.extraction import DocumentExtraction, ExtractedPage
 from nexusrag.storage import save_extraction
 
 client = TestClient(app)
+pytestmark = pytest.mark.usefixtures("initialized_job_database")
 SAMPLE_PDF = Path(__file__).resolve().parents[1] / "examples/employee-handbook.pdf"
 
 

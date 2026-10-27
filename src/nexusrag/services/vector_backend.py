@@ -1,5 +1,7 @@
 """Generation-scoped Qdrant indexing and search; application wiring is separate."""
 
+from uuid import UUID
+
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
@@ -36,6 +38,27 @@ class QdrantBackend:
         """Close clients created by this adapter; injected clients belong to callers."""
         if self._owns_client:
             await self.client.close()
+
+    async def delete_document(self, document_id: UUID) -> None:
+        """Delete every generation for this document, preserving other documents."""
+        if not await self.client.collection_exists(self.collection):
+            return
+        result = await self.client.delete(
+            collection_name=self.collection,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=str(document_id)),
+                        )
+                    ]
+                )
+            ),
+            wait=True,
+        )
+        if result.status != models.UpdateStatus.COMPLETED:
+            raise RuntimeError("Qdrant point deletion was not completed")
 
     async def index_document(
         self,

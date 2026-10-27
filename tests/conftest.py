@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from nexusrag import config
+from nexusrag.database import initialize_database
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +53,13 @@ def job_database_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "jobs.sqlite3"
     monkeypatch.setattr(config, "JOB_DATABASE_PATH", path)
     return path
+
+
+@pytest.fixture
+def initialized_job_database(job_database_path: Path) -> Path:
+    """Supply startup schema for HTTP tests whose clients do not enter lifespan."""
+    initialize_database(job_database_path)
+    return job_database_path
 
 
 @pytest.fixture

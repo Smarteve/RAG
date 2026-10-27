@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi.concurrency import run_in_threadpool
 
 from nexusrag.schemas.job import JobStatus, ProcessingJob
+from nexusrag.services.document_state import deletion_status
 from nexusrag.services.jobs import job_transition
 
 
@@ -47,6 +48,9 @@ def _create_job(
     connection = sqlite3.connect(database_path)
     try:
         with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if deletion_status(connection, job.document_id) is not None:
+                raise ValueError("Cannot create a job for a deleted document")
             connection.execute(
                 "INSERT INTO processing_jobs (job_id, record) VALUES (?, ?)",
                 (str(job.job_id), job.model_dump_json()),
@@ -103,6 +107,11 @@ def _transition_job(
             current_job = ProcessingJob.model_validate_json(row[0])
             if current_job.job_id != job_id:
                 raise ValueError("Stored job ID does not match requested job")
+            if (
+                new_status == "running"
+                and deletion_status(connection, current_job.document_id) is not None
+            ):
+                raise ValueError("Cannot process a deleted document")
 
             updated_job = job_transition(current_job, new_status, error)
             connection.execute(

@@ -20,6 +20,7 @@ from nexusrag.services.chunking import chunk_document
 
 main = import_module("nexusrag.main")
 client = TestClient(app)
+pytestmark = pytest.mark.usefixtures("initialized_job_database")
 SAMPLE_PDF = Path(__file__).resolve().parents[1] / "examples/employee-handbook.pdf"
 
 

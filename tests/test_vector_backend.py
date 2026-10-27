@@ -88,6 +88,70 @@ def test_creates_collection_with_record_dimensions_and_uploads_all_points(client
     assert points == build_points(chunks, embeddings)
 
 
+def test_delete_missing_collection_is_idempotent(client):
+    asyncio.run(QdrantBackend(client).delete_document(uuid4()))
+    client.delete.assert_not_awaited()
+    client.create_collection.assert_not_awaited()
+
+
+def test_delete_waits_for_completion_and_filters_only_document_id(client):
+    document_id = uuid4()
+    client.collection_exists.return_value = True
+    client.delete.return_value = models.UpdateResult(
+        status=models.UpdateStatus.COMPLETED
+    )
+    asyncio.run(
+        QdrantBackend(client, collection="test-vectors").delete_document(document_id)
+    )
+    call = client.delete.await_args.kwargs
+    assert call["collection_name"] == "test-vectors"
+    assert call["wait"] is True
+    assert call["points_selector"].filter == models.Filter(
+        must=[
+            models.FieldCondition(
+                key="document_id", match=models.MatchValue(value=str(document_id))
+            )
+        ]
+    )
+
+
+def test_unconfirmed_vector_deletion_is_not_success(client):
+    client.collection_exists.return_value = True
+    client.delete.return_value = models.UpdateResult(
+        status=models.UpdateStatus.ACKNOWLEDGED
+    )
+    with pytest.raises(RuntimeError, match="deletion was not completed"):
+        asyncio.run(QdrantBackend(client).delete_document(uuid4()))
+
+
+def test_real_local_delete_removes_all_generations_and_keeps_other_documents():
+    async def exercise():
+        client = AsyncQdrantClient(":memory:")
+        try:
+            backend = QdrantBackend(client, collection="delete-test")
+            chunks, embeddings = records()
+            other_chunks, other_embeddings = records()
+            await backend.index_document(chunks, embeddings)
+            await backend.index_document(
+                chunks, embeddings.model_copy(update={"index_generation": uuid4()})
+            )
+            await backend.index_document(other_chunks, other_embeddings)
+            await backend.delete_document(chunks.document_id)
+            await backend.delete_document(chunks.document_id)
+            points, _ = await client.scroll("delete-test", limit=20, with_payload=True)
+            assert len(points) == len(other_chunks.chunks)
+            assert all(
+                point.payload["document_id"] == str(other_chunks.document_id)
+                for point in points
+            )
+            assert await backend.search(other_chunks, other_embeddings, [1, 0, 0], 5)
+            assert await backend.search(chunks, embeddings, [1, 0, 0], 5) == []
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(
     "vectors",
     [

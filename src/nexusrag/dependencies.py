@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
 from nexusrag import config
+from nexusrag.services.document_state import is_document_deleted
 from nexusrag.services.embedding_runtime import EmbeddingRuntime
 from nexusrag.services.generation_runtime import AnswerGenerator, GroqAnswerGenerator
 from nexusrag.services.job_storage import load_document_job
@@ -32,6 +33,18 @@ async def get_answer_generator(request: Request) -> AnswerGenerator:
     return generator
 
 
+async def require_available_document(document_id: UUID) -> None:
+    """Deletion intent hides artifacts even when cleanup has not yet finished."""
+    try:
+        deleted = await is_document_deleted(document_id, config.JOB_DATABASE_PATH)
+    except (sqlite3.Error, OSError) as error:
+        raise HTTPException(
+            500, detail="Could not check document availability"
+        ) from error
+    if deleted:
+        raise HTTPException(404, detail="Document not found")
+
+
 async def require_reindex_lock(document_id: UUID) -> AsyncIterator[None]:
     """Serialize manual reindexing with queued processing and recovery."""
     guard = document_lock(document_id, config.JOB_DATABASE_PATH)
@@ -44,6 +57,7 @@ async def require_reindex_lock(document_id: UUID) -> AsyncIterator[None]:
     except OSError as error:
         raise HTTPException(500, detail="Could not lock document") from error
     try:
+        await require_available_document(document_id)
         try:
             job = await load_document_job(document_id, config.JOB_DATABASE_PATH)
         except (sqlite3.Error, OSError, ValueError) as error:

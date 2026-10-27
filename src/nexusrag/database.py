@@ -14,6 +14,12 @@ def initialize_database(database_path: Path) -> None:
                     record TEXT NOT NULL
                 )
                 """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS document_deletions (
+                    document_id TEXT PRIMARY KEY NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('deleting', 'deleted'))
+                )
+                """)
             # Enforce one child per failed attempt and one number per chain.
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS unique_retry_parent "

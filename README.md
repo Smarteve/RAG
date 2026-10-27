@@ -200,6 +200,46 @@ the `redis_data` named volume; Qdrant uses `qdrant_data`. Avoid
 uses AOF with once-per-second syncing; a sudden crash can lose recent writes.
 These mounts preserve data across container replacement, but are not backups.
 
+### Delete a document
+
+Use `DELETE /documents/{document_id}` in `/docs`, or supply the actual document
+ID in this command:
+
+```bash
+curl -i -X DELETE "http://127.0.0.1:8000/documents/<document_id>"
+```
+
+Deletion removes the original PDF, extraction/chunk/embedding JSON, leftover
+temporary files for that document, and all its Qdrant point generations,
+including unpublished generations from failed indexing. Other documents, the
+shared model cache, and document lock files are preserved. SQLite job history
+remains accessible through `GET /jobs/{job_id}`; its status records processing
+history, not current document availability. Redis job metadata is not purged.
+
+| Result | Meaning |
+| --- | --- |
+| `204` | Cleanup completed; already-deleted or unknown IDs also succeed |
+| `409` | A job is queued/running, or processing, reindexing, retry, or deletion owns the document lock |
+| `422` | The document ID is not a UUID |
+| `503` | Qdrant cleanup could not be confirmed; repeat DELETE |
+| `500` | Database or file cleanup failed; resolve the problem and repeat DELETE |
+
+The service takes the same document lock as processing/reindexing/retry, checks
+for active jobs, then commits a `deleting` record in SQLite before remote or file
+cleanup. From that point, document reads, searches, `/ask`, and reindexing return
+`404`, and no new job or retry may resurrect the document. Requests already in
+flight may finish. Once cleanup succeeds, the record becomes `deleted`.
+
+SQLite, Qdrant, and the filesystem do not share a transaction. A failure after
+deletion starts leaves the document hidden, with cleanup safely repeatable using
+the same DELETE request. Pending deletions are not automatically resumed by the
+job sweeper. Startup adds the deletion table to existing databases; rebuild and
+recreate all application services after this update:
+
+```bash
+docker compose up --build -d --wait
+```
+
 ### Queue behavior and storage
 
 `POST /documents` validates and saves the PDF, records a queued job in SQLite,
@@ -899,7 +939,8 @@ writes, and only then atomically saves the local embedding record.
 The JSON record still includes vectors for the existing cosine reference and
 identifies the published generation. An upload failure preserves the previous
 record; a local-save failure leaves the new remote generation unreferenced.
-Old generations are retained for now; garbage collection is a separate step.
+Old generations of retained documents remain for now; generation garbage
+collection is a separate step. Deleting a document removes all its generations.
 Local chunk text remains the citation source. Semantic search and `/ask` now
 use the request-injected Qdrant backend for similarity lookup. The keyword
 `/search` endpoint remains independent of Qdrant. The original Python cosine

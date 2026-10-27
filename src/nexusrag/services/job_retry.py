@@ -10,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from nexusrag import config
 from nexusrag.schemas.job import ProcessingJob
+from nexusrag.services.document_state import deletion_status
 from nexusrag.services.job_storage import _document_jobs, _latest_attempt, _load_job
 from nexusrag.services.processing_lock import document_lock
 from nexusrag.services.queue import enqueue_processing
@@ -68,6 +69,8 @@ def _create_retry(
         try:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if deletion_status(connection, snapshot.document_id) is not None:
+                    raise RetryNotAllowedError("Document has been deleted")
                 jobs = _document_jobs(connection, snapshot.document_id)
                 latest = _latest_attempt(jobs)
                 current = next((job for job in jobs if job.job_id == job_id), None)
@@ -124,7 +127,9 @@ def _load_retry_candidates(
     connection = sqlite3.connect(database_path)
     try:
         rows = connection.execute(
-            "SELECT job_id, record FROM processing_jobs"
+            "SELECT job_id, record FROM processing_jobs WHERE NOT EXISTS ("
+            "SELECT 1 FROM document_deletions WHERE document_id = "
+            "json_extract(processing_jobs.record, '$.document_id'))"
         ).fetchall()
         documents: dict[UUID, list[ProcessingJob]] = {}
         for stored_id, record in rows:

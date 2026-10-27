@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, UploadFile
 from fastapi import Path as PathParameter
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -15,6 +15,7 @@ from nexusrag.dependencies import (
     get_answer_generator,
     get_embedding_runtime,
     get_vector_backend,
+    require_available_document,
     require_reindex_lock,
 )
 from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
@@ -24,7 +25,14 @@ from nexusrag.schemas.embedding import SemanticIndexResponse
 from nexusrag.schemas.extraction import FetchPageResponse
 from nexusrag.schemas.job import ProcessingJob
 from nexusrag.schemas.retrieval import SearchResponse, SemanticSearchResponse
-from nexusrag.services import answering, indexing, ingestion, retrieval, search
+from nexusrag.services import (
+    answering,
+    document_deletion,
+    indexing,
+    ingestion,
+    retrieval,
+    search,
+)
 from nexusrag.services.embedding_model import EmbeddingInputError
 from nexusrag.services.embedding_runtime import (
     EmbeddingModelUnavailableError,
@@ -38,6 +46,7 @@ from nexusrag.services.generation_runtime import (
     GenerationUnavailableError,
 )
 from nexusrag.services.job_storage import load_document_job, load_job
+from nexusrag.services.processing_lock import DocumentBusyError
 from nexusrag.services.vector_backend import QdrantBackend
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
@@ -97,9 +106,47 @@ async def upload_document(file: UploadFile) -> QueuedUploadResponse:
         await file.close()
 
 
+@app.delete("/documents/{document_id}", status_code=204)
+async def delete_document(
+    document_id: UUID,
+    backend: Annotated[QdrantBackend, Depends(get_vector_backend)],
+) -> Response:
+    """Retire a document and remove all its vector generations and local artifacts."""
+    try:
+        await document_deletion.delete_document(
+            document_id,
+            database_path=config.JOB_DATABASE_PATH,
+            storage_directory=config.STORAGE_DIRECTORY,
+            extraction_directory=config.EXTRACTION_DIRECTORY,
+            chunk_directory=config.CHUNK_DIRECTORY,
+            embedding_directory=config.EMBEDDING_DIRECTORY,
+            backend=backend,
+        )
+    except (DocumentBusyError, document_deletion.DocumentProcessingError) as error:
+        raise HTTPException(
+            409,
+            detail="Document processing, reindexing, or another operation is active",
+        ) from error
+    except document_deletion.VectorDeletionError as error:
+        logger.warning("Could not confirm vector deletion for document %s", document_id)
+        raise HTTPException(
+            503,
+            detail="Document deletion is incomplete; retry DELETE to finish cleanup",
+        ) from error
+    except (sqlite3.Error, OSError, ValueError) as error:
+        logger.error(
+            "Could not delete document %s (%s)", document_id, type(error).__name__
+        )
+        raise HTTPException(
+            500, detail="Could not complete document deletion; retry DELETE"
+        ) from error
+    return Response(status_code=204)
+
+
 @app.get(
     "/documents/{document_id}/pages/{page_number}",
     response_model=FetchPageResponse,
+    dependencies=[Depends(require_available_document)],
 )
 async def fetch_page(
     document_id: UUID,
@@ -141,7 +188,11 @@ async def fetch_page(
     raise HTTPException(404, detail="Requested page does not exist")
 
 
-@app.get("/documents/{document_id}/chunks", response_model=FetchChunksResponse)
+@app.get(
+    "/documents/{document_id}/chunks",
+    response_model=FetchChunksResponse,
+    dependencies=[Depends(require_available_document)],
+)
 async def fetch_chunks(
     document_id: UUID,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -175,7 +226,11 @@ async def fetch_chunks(
     )
 
 
-@app.get("/documents/{document_id}/search", response_model=SearchResponse)
+@app.get(
+    "/documents/{document_id}/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_available_document)],
+)
 async def search_document(
     document_id: UUID,
     query: Annotated[str, Query(min_length=1, max_length=500)],
@@ -293,6 +348,7 @@ async def build_document_semantic_index(
 @app.get(
     "/documents/{document_id}/semantic-search",
     response_model=SemanticSearchResponse,
+    dependencies=[Depends(require_available_document)],
 )
 async def semantic_search_document(
     document_id: UUID,
@@ -362,7 +418,11 @@ async def semantic_search_document(
         raise HTTPException(500, detail="Could not search document") from error
 
 
-@app.post("/documents/{document_id}/ask", response_model=AskDocumentResponse)
+@app.post(
+    "/documents/{document_id}/ask",
+    response_model=AskDocumentResponse,
+    dependencies=[Depends(require_available_document)],
+)
 async def ask_document(
     document_id: UUID,
     request: AskDocumentRequest,
