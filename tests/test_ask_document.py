@@ -11,7 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nexusrag import config, storage
-from nexusrag.dependencies import get_answer_generator, get_embedding_runtime
+from nexusrag.dependencies import (
+    get_answer_generator,
+    get_embedding_runtime,
+    get_vector_backend,
+)
 from nexusrag.schemas.answer import AskDocumentResponse, GeneratedAnswer
 from nexusrag.schemas.chunk import DocumentChunk, DocumentChunks
 from nexusrag.schemas.embedding import ChunkEmbedding, DocumentEmbeddings
@@ -73,7 +77,7 @@ def runtime_holder() -> list[EmbeddingRuntime]:
 
 
 @pytest.fixture
-def client(loader, generator, runtime_holder):
+def client(loader, generator, runtime_holder, vector_search_backend):
     async def embedding_dependency():
         if not runtime_holder:
             runtime_holder.append(EmbeddingRuntime(loader))
@@ -82,7 +86,11 @@ def client(loader, generator, runtime_holder):
     async def generation_dependency():
         return generator
 
+    async def backend_dependency():
+        return vector_search_backend
+
     overrides = main.app.dependency_overrides.copy()
+    main.app.dependency_overrides[get_vector_backend] = backend_dependency
     main.app.dependency_overrides[get_embedding_runtime] = embedding_dependency
     main.app.dependency_overrides[get_answer_generator] = generation_dependency
     try:
@@ -118,6 +126,7 @@ def save_records(count: int = 3) -> tuple[DocumentChunks, DocumentEmbeddings]:
         model_id="test-encoder",
         model_revision="test-v1",
         dimensions=3,
+        index_generation=uuid4(),
         source_digest=sha256(chunks.model_dump_json().encode("utf-8")).hexdigest(),
         embeddings=[
             ChunkEmbedding(chunk_index=index, vector=vectors[index % 3])
@@ -513,15 +522,17 @@ def test_repeated_questions_reuse_embedding_model_but_generate_separately(
     assert generator.generate.await_count == 2
 
 
-def test_encoding_ranking_and_context_building_are_offloaded(
-    client, embedder, monkeypatch
-) -> None:
-    chunks, _ = save_records()
-    event_loop_threads = []
-    worker_threads = []
+def test_encoding_and_context_building_are_offloaded_with_async_backend(
+    client,
+    embedder,
+    monkeypatch,
+    vector_search_backend,
+):
+    chunks, embeddings = save_records()
+    event_loop_threads, worker_threads, backend_threads = [], [], []
     original_load = storage.load_chunks
-    original_rank = retrieval.search_semantic_chunks
     original_context = context.build_context
+    hits = retrieval.search_semantic_chunks(chunks, embeddings, [1.0, 0.0, 0.0], 5)
 
     async def load(*args):
         event_loop_threads.append(get_ident())
@@ -529,24 +540,24 @@ def test_encoding_ranking_and_context_building_are_offloaded(
 
     def encode(query):
         worker_threads.append(get_ident())
-        return [1, 0, 0]
+        return [1.0, 0.0, 0.0]
 
-    def rank(*args):
-        worker_threads.append(get_ident())
-        return original_rank(*args)
+    async def remote(*args):
+        backend_threads.append(get_ident())
+        return hits
 
     def prepare(*args, **kwargs):
         worker_threads.append(get_ident())
         return original_context(*args, **kwargs)
 
     monkeypatch.setattr(storage, "load_chunks", load)
-    monkeypatch.setattr(retrieval, "search_semantic_chunks", rank)
+    vector_search_backend.search.side_effect = remote
     monkeypatch.setattr(context, "build_context", prepare)
     embedder.embed_query.side_effect = encode
-
     assert ask(client, chunks.document_id).status_code == 200
-    assert len(worker_threads) == 3
+    assert len(worker_threads) == 2
     assert set(worker_threads).isdisjoint(event_loop_threads)
+    assert backend_threads == event_loop_threads
 
 
 def test_ask_does_not_call_other_http_endpoint_functions(client, monkeypatch) -> None:
@@ -653,4 +664,28 @@ def test_readiness_database_failure_is_safe(client, monkeypatch, generator):
     response = client.post(f"/documents/{uuid4()}/ask", json={"question": QUESTION})
     assert response.status_code == 500
     assert response.json() == {"detail": "Could not check document readiness"}
+    generator.generate.assert_not_awaited()
+
+
+def test_legacy_index_requires_rebuild_without_generation_call(
+    client, loader, generator, vector_search_backend
+):
+    chunks, embeddings = save_records()
+    embeddings.index_generation = None
+    asyncio.run(storage.save_embeddings(embeddings, config.EMBEDDING_DIRECTORY))
+    response = ask(client, chunks.document_id)
+    assert response.status_code == 409
+    loader.assert_not_called()
+    vector_search_backend.search.assert_not_awaited()
+    generator.generate.assert_not_awaited()
+
+
+def test_backend_failure_is_safe_and_never_calls_generator(
+    client, generator, vector_search_backend
+):
+    chunks, _ = save_records()
+    vector_search_backend.search.side_effect = RuntimeError("private Qdrant endpoint")
+    response = ask(client, chunks.document_id)
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Could not answer document"}
     generator.generate.assert_not_awaited()

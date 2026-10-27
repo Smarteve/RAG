@@ -1,4 +1,5 @@
 import asyncio
+from importlib import import_module
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pypdf import PdfWriter
 
-from nexusrag import config, main, storage
+from nexusrag import config, storage
 from nexusrag.main import app
 from nexusrag.schemas.chunk import DocumentChunks
 from nexusrag.schemas.extraction import DocumentExtraction, ExtractedPage
@@ -17,6 +18,7 @@ from nexusrag.schemas.retrieval import SearchHit, SearchResponse
 from nexusrag.services import retrieval
 from nexusrag.services.chunking import chunk_document
 
+main = import_module("nexusrag.main")
 client = TestClient(app)
 SAMPLE_PDF = Path(__file__).resolve().parents[1] / "examples/employee-handbook.pdf"
 

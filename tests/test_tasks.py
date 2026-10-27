@@ -33,6 +33,8 @@ def workflow(
     runtime.use_embedder.return_value.__aexit__ = AsyncMock(return_value=False)
     monkeypatch.setattr(tasks, "EmbeddingRuntime", Mock(return_value=runtime))
     monkeypatch.setattr(tasks, "build_semantic_index", AsyncMock())
+    backend = Mock(index_document=AsyncMock(), aclose=AsyncMock())
+    monkeypatch.setattr(tasks, "QdrantBackend", Mock(return_value=backend))
     return job, transition, process
 
 
@@ -46,6 +48,9 @@ def test_success_marks_ready_after_indexing(workflow) -> None:
     tasks.save_extraction.assert_awaited_once()
     tasks.save_chunks.assert_awaited_once()
     tasks.build_semantic_index.assert_awaited_once()
+    backend = tasks.QdrantBackend.return_value
+    assert tasks.build_semantic_index.await_args.kwargs["backend"] is backend
+    backend.aclose.assert_awaited_once()
     assert tasks.build_semantic_index.await_args.args[0] == job.document_id
 
 
@@ -109,3 +114,30 @@ def test_task_entry_point_holds_lock_through_work(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tasks, "_process_document", process)
     tasks.process_document(str(job_id))
+
+
+def test_index_failure_closes_worker_backend(workflow):
+    job, transition, _ = workflow
+    tasks.build_semantic_index.side_effect = RuntimeError("Index failed")
+    with pytest.raises(RuntimeError, match="Index failed"):
+        asyncio.run(tasks._process_document(job.job_id))
+    tasks.QdrantBackend.return_value.aclose.assert_awaited_once()
+    assert transition.await_args.args[1] == "failed"
+
+
+def test_backend_request_dependency_closes_client_on_error(monkeypatch):
+    from contextlib import aclosing
+
+    from nexusrag import dependencies
+
+    backend = Mock(aclose=AsyncMock())
+    monkeypatch.setattr(dependencies, "QdrantBackend", Mock(return_value=backend))
+
+    async def request():
+        async with aclosing(dependencies.get_vector_backend()) as dependency:
+            assert await anext(dependency) is backend
+            raise RuntimeError("Request failed")
+
+    with pytest.raises(RuntimeError, match="Request failed"):
+        asyncio.run(request())
+    backend.aclose.assert_awaited_once()

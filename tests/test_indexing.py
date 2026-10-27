@@ -47,7 +47,7 @@ def make_embedder(revision: str = "test-revision") -> Mock:
 
 @pytest.mark.parametrize("count", [0, 2, 17])
 def test_build_saves_complete_index_and_preserves_chunks(
-    tmp_path: Path, count: int
+    backend, tmp_path: Path, count: int
 ) -> None:
     chunks = make_chunks(count)
     chunk_directory = tmp_path / "chunks"
@@ -58,7 +58,11 @@ def test_build_saves_complete_index_and_preserves_chunks(
 
     result = asyncio.run(
         indexing.build_semantic_index(
-            chunks.document_id, embedder, chunk_directory, embedding_directory
+            chunks.document_id,
+            embedder,
+            chunk_directory,
+            embedding_directory,
+            backend=backend,
         )
     )
 
@@ -84,7 +88,9 @@ def test_build_saves_complete_index_and_preserves_chunks(
     ]
 
 
-def test_successful_rebuild_replaces_previous_complete_index(tmp_path: Path) -> None:
+def test_successful_rebuild_replaces_previous_complete_index(
+    backend, tmp_path: Path
+) -> None:
     chunks = make_chunks()
     chunk_directory = tmp_path / "chunks"
     embedding_directory = tmp_path / "embeddings"
@@ -94,7 +100,11 @@ def test_successful_rebuild_replaces_previous_complete_index(tmp_path: Path) -> 
 
     result = asyncio.run(
         indexing.build_semantic_index(
-            chunks.document_id, make_embedder(), chunk_directory, embedding_directory
+            chunks.document_id,
+            make_embedder(),
+            chunk_directory,
+            embedding_directory,
+            backend=backend,
         )
     )
 
@@ -108,7 +118,7 @@ def test_successful_rebuild_replaces_previous_complete_index(tmp_path: Path) -> 
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_third_batch_failure_never_saves_partial_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+    backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
 ) -> None:
     chunks = make_chunks(17)
     chunk_directory = tmp_path / "chunks"
@@ -134,7 +144,11 @@ def test_third_batch_failure_never_saves_partial_index(
     with pytest.raises(RuntimeError) as raised:
         asyncio.run(
             indexing.build_semantic_index(
-                chunks.document_id, embedder, chunk_directory, embedding_directory
+                chunks.document_id,
+                embedder,
+                chunk_directory,
+                embedding_directory,
+                backend=backend,
             )
         )
 
@@ -150,7 +164,7 @@ def test_third_batch_failure_never_saves_partial_index(
 
 @pytest.mark.parametrize("vector", [[0.0, 0.0, 0.0], [1.0, 0.0]])
 def test_invalid_model_output_is_not_saved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: list[float]
+    backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vector: list[float]
 ) -> None:
     chunks = make_chunks(1)
     chunk_directory = tmp_path / "chunks"
@@ -163,7 +177,11 @@ def test_invalid_model_output_is_not_saved(
     with pytest.raises(ValidationError):
         asyncio.run(
             indexing.build_semantic_index(
-                chunks.document_id, embedder, chunk_directory, tmp_path / "embeddings"
+                chunks.document_id,
+                embedder,
+                chunk_directory,
+                tmp_path / "embeddings",
+                backend=backend,
             )
         )
 
@@ -179,7 +197,7 @@ def test_invalid_model_output_is_not_saved(
     ],
 )
 def test_load_failure_stops_before_encoding_or_saving(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+    backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
     document_id = uuid4()
     embedder = make_embedder()
@@ -191,7 +209,11 @@ def test_load_failure_stops_before_encoding_or_saving(
     with pytest.raises(type(error)) as raised:
         asyncio.run(
             indexing.build_semantic_index(
-                document_id, embedder, tmp_path / "chunks", tmp_path / "embeddings"
+                document_id,
+                embedder,
+                tmp_path / "chunks",
+                tmp_path / "embeddings",
+                backend=backend,
             )
         )
 
@@ -203,7 +225,7 @@ def test_load_failure_stops_before_encoding_or_saving(
 
 
 def test_failed_publish_preserves_previous_index_and_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chunks = make_chunks()
     chunk_directory = tmp_path / "chunks"
@@ -227,6 +249,7 @@ def test_failed_publish_preserves_previous_index_and_source(
                 make_embedder(),
                 chunk_directory,
                 embedding_directory,
+                backend=backend,
             )
         )
 
@@ -236,7 +259,7 @@ def test_failed_publish_preserves_previous_index_and_source(
     assert list(embedding_directory.iterdir()) == [destination]
 
 
-def test_model_work_runs_in_worker_thread(tmp_path: Path) -> None:
+def test_model_work_runs_in_worker_thread(backend, tmp_path: Path) -> None:
     chunks = make_chunks()
     chunk_directory = tmp_path / "chunks"
     asyncio.run(storage.save_chunks(chunks, chunk_directory))
@@ -257,9 +280,98 @@ def test_model_work_runs_in_worker_thread(tmp_path: Path) -> None:
 
     asyncio.run(
         indexing.build_semantic_index(
-            chunks.document_id, embedder, chunk_directory, tmp_path / "embeddings"
+            chunks.document_id,
+            embedder,
+            chunk_directory,
+            tmp_path / "embeddings",
+            backend=backend,
         )
     )
 
     assert len(worker_threads) == 2
     assert all(thread != event_loop_thread for thread in worker_threads)
+
+
+@pytest.fixture
+def backend():
+    return AsyncMock(spec=indexing.VectorIndexBackend)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_backend_failure_never_publishes_new_generation(backend, tmp_path, existing):
+    chunks = make_chunks()
+    chunk_directory = tmp_path / "chunks"
+    embedding_directory = tmp_path / "embeddings"
+    source = asyncio.run(storage.save_chunks(chunks, chunk_directory))
+    before_source = source.read_bytes()
+    destination = embedding_directory / f"{chunks.document_id}.json"
+    previous_bytes = None
+    if existing:
+        previous = embed_chunks(chunks, make_embedder("old"))
+        previous.index_generation = uuid4()
+        asyncio.run(storage.save_embeddings(previous, embedding_directory))
+        previous_bytes = destination.read_bytes()
+    failure = RuntimeError("Qdrant unavailable")
+    backend.index_document.side_effect = failure
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(
+            indexing.build_semantic_index(
+                chunks.document_id,
+                make_embedder(),
+                chunk_directory,
+                embedding_directory,
+                backend=backend,
+            )
+        )
+    assert caught.value is failure
+    backend.index_document.assert_awaited_once()
+    uploaded = backend.index_document.await_args.args[1]
+    assert uploaded.index_generation is not None
+    assert source.read_bytes() == before_source
+    if existing:
+        assert destination.read_bytes() == previous_bytes
+    else:
+        assert not destination.exists()
+
+
+def test_upload_finishes_before_publish_and_rebuild_gets_fresh_generation(
+    backend, tmp_path
+):
+    chunks = make_chunks()
+    chunk_directory = tmp_path / "chunks"
+    embedding_directory = tmp_path / "embeddings"
+    asyncio.run(storage.save_chunks(chunks, chunk_directory))
+    previous = embed_chunks(chunks, make_embedder("old"))
+    previous.index_generation = uuid4()
+    asyncio.run(storage.save_embeddings(previous, embedding_directory))
+    generations = []
+
+    async def upload(actual_chunks, record):
+        assert actual_chunks == chunks
+        published = await storage.load_embeddings(
+            chunks.document_id, embedding_directory
+        )
+        assert published.index_generation == (
+            generations[-1] if generations else previous.index_generation
+        )
+        generations.append(record.index_generation)
+
+    backend.index_document.side_effect = upload
+    for _ in range(2):
+        result = asyncio.run(
+            indexing.build_semantic_index(
+                chunks.document_id,
+                make_embedder(),
+                chunk_directory,
+                embedding_directory,
+                backend=backend,
+            )
+        )
+        assert (
+            asyncio.run(
+                storage.load_embeddings(chunks.document_id, embedding_directory)
+            )
+            == result
+        )
+    assert len(set(generations)) == 2
+    assert previous.index_generation not in generations

@@ -52,3 +52,21 @@ def job_database_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "jobs.sqlite3"
     monkeypatch.setattr(config, "JOB_DATABASE_PATH", path)
     return path
+
+
+@pytest.fixture
+def vector_search_backend():
+    """Offline reference backend for HTTP orchestration tests, never Qdrant IO."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.concurrency import run_in_threadpool
+
+    from nexusrag.services import retrieval
+
+    async def search(chunks, embeddings, query_vector, limit):
+        return await run_in_threadpool(
+            retrieval.search_semantic_chunks, chunks, embeddings, query_vector, limit
+        )
+
+    return SimpleNamespace(search=AsyncMock(side_effect=search))

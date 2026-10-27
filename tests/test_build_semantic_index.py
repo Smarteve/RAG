@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nexusrag import config, storage
-from nexusrag.dependencies import get_embedding_runtime
+from nexusrag.dependencies import get_embedding_runtime, get_vector_backend
 from nexusrag.schemas.chunk import DocumentChunk, DocumentChunks
 from nexusrag.schemas.embedding import SemanticIndexResponse
 from nexusrag.services.embedding import embed_chunks
@@ -41,7 +41,7 @@ def loader(embedder: Mock) -> Mock:
 
 
 @pytest.fixture
-def client(loader: Mock):
+def client(loader: Mock, backend):
     runtime = None
 
     async def dependency():
@@ -50,12 +50,21 @@ def client(loader: Mock):
             runtime = EmbeddingRuntime(loader)
         return runtime
 
+    async def backend_dependency():
+        return backend
+
+    previous_backend = main.app.dependency_overrides.get(get_vector_backend)
+    main.app.dependency_overrides[get_vector_backend] = backend_dependency
     previous = main.app.dependency_overrides.get(get_embedding_runtime)
     main.app.dependency_overrides[get_embedding_runtime] = dependency
     try:
         with TestClient(main.app) as test_client:
             yield test_client
     finally:
+        if previous_backend is None:
+            main.app.dependency_overrides.pop(get_vector_backend, None)
+        else:
+            main.app.dependency_overrides[get_vector_backend] = previous_backend
         if previous is None:
             main.app.dependency_overrides.pop(get_embedding_runtime, None)
         else:
@@ -107,7 +116,10 @@ def test_post_builds_complete_index_and_returns_only_metadata(
     saved = asyncio.run(
         storage.load_embeddings(chunks.document_id, config.EMBEDDING_DIRECTORY)
     )
-    assert saved == embed_chunks(chunks, loader.return_value)
+    assert saved.index_generation is not None
+    assert saved.model_dump(exclude={"index_generation"}) == embed_chunks(
+        chunks, loader.return_value
+    ).model_dump(exclude={"index_generation"})
     assert source.read_bytes() == original
     loader.assert_called_once_with()
 
@@ -131,7 +143,10 @@ def test_rebuild_reuses_model_and_replaces_index_for_current_chunks(
         storage.load_embeddings(chunks.document_id, config.EMBEDDING_DIRECTORY)
     )
     assert current.source_digest != previous.source_digest
-    assert current == embed_chunks(chunks, loader.return_value)
+    assert current.index_generation != previous.index_generation
+    assert current.model_dump(exclude={"index_generation"}) == embed_chunks(
+        chunks, loader.return_value
+    ).model_dump(exclude={"index_generation"})
     loader.assert_called_once_with()
 
 
@@ -384,3 +399,23 @@ def test_manual_indexing_rejects_unfinished_jobs(client, loader, status):
     response = client.post(f"/documents/{chunks.document_id}/semantic-index")
     assert response.status_code == 409
     loader.assert_not_called()
+
+
+@pytest.fixture
+def backend():
+    return AsyncMock(spec=main.indexing.VectorIndexBackend)
+
+
+def test_qdrant_failure_returns_safe_error_and_keeps_previous_index(
+    client, backend, embedder
+):
+    chunks = save_source()
+    previous = embed_chunks(chunks, embedder)
+    previous.index_generation = uuid4()
+    path = asyncio.run(storage.save_embeddings(previous, config.EMBEDDING_DIRECTORY))
+    original = path.read_bytes()
+    backend.index_document.side_effect = RuntimeError("private backend URL")
+    response = client.post(f"/documents/{chunks.document_id}/semantic-index")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Could not build semantic index"}
+    assert path.read_bytes() == original

@@ -32,6 +32,9 @@ class DocumentEmbeddings(BaseModel):
     dimensions: int = Field(gt=0)
     source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     embeddings: list[ChunkEmbedding]
+    # Legacy filesystem indexes have no Qdrant generation. Assign a fresh UUID
+    # for each build before writing points; publish this record only afterward.
+    index_generation: UUID | None = None
 
     @model_validator(mode="after")
     def validate_embeddings(self) -> Self:

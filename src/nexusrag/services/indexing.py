@@ -1,12 +1,20 @@
 from pathlib import Path
-from uuid import UUID
+from typing import Protocol
+from uuid import UUID, uuid4
 
 from fastapi.concurrency import run_in_threadpool
 
+from nexusrag.schemas.chunk import DocumentChunks
 from nexusrag.schemas.embedding import DocumentEmbeddings
 from nexusrag.services.embedding import embed_chunks
 from nexusrag.services.embedding_model import MiniEmbedder
 from nexusrag.storage import load_chunks, save_embeddings
+
+
+class VectorIndexBackend(Protocol):
+    async def index_document(
+        self, chunks: DocumentChunks, embeddings: DocumentEmbeddings
+    ) -> None: ...
 
 
 async def build_semantic_index(
@@ -14,17 +22,19 @@ async def build_semantic_index(
     embedder: MiniEmbedder,
     chunk_directory: Path,
     embedding_directory: Path,
+    *,
+    backend: VectorIndexBackend,
 ) -> DocumentEmbeddings:
-    """Load chunks, encode in a worker thread, and publish a complete index.
+    """Encode, upload one fresh generation, then atomically publish its record.
 
-    The caller supplies an already-loaded embedder and controls concurrent
-    inference. Storage and encoding errors propagate without HTTP translation.
-    Encoding must finish before saving; atomic storage preserves a previous
-    complete index if encoding or publishing the replacement fails. Source
-    chunks are not modified. The record describes the loaded chunk snapshot,
-    so search must still check its digest against the current chunks.
+    The caller owns the model, processing lock, and backend lifecycle. Qdrant
+    writes must complete before local publication; failed uploads preserve the
+    previous published record. A local publish failure leaves an unreferenced
+    remote generation, without replacing the old one. Errors propagate.
     """
     chunks = await load_chunks(document_id, chunk_directory)
-    record = await run_in_threadpool(embed_chunks, chunks, embedder)
-    await save_embeddings(record, embedding_directory)
-    return record
+    embeddings = await run_in_threadpool(embed_chunks, chunks, embedder)
+    embeddings.index_generation = uuid4()
+    await backend.index_document(chunks, embeddings)
+    await save_embeddings(embeddings, embedding_directory)
+    return embeddings

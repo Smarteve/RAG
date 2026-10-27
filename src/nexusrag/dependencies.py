@@ -10,6 +10,7 @@ from nexusrag.services.embedding_runtime import EmbeddingRuntime
 from nexusrag.services.generation_runtime import AnswerGenerator, GroqAnswerGenerator
 from nexusrag.services.job_storage import load_document_job
 from nexusrag.services.processing_lock import DocumentBusyError, document_lock
+from nexusrag.services.vector_backend import QdrantBackend
 
 
 async def get_embedding_runtime(request: Request) -> EmbeddingRuntime:
@@ -56,3 +57,12 @@ async def require_reindex_lock(document_id: UUID) -> AsyncIterator[None]:
         yield
     finally:
         await run_in_threadpool(guard.__exit__, None, None, None)
+
+
+async def get_vector_backend() -> AsyncIterator[QdrantBackend]:
+    """Own one asynchronous Qdrant client for this request's event loop."""
+    backend = QdrantBackend()
+    try:
+        yield backend
+    finally:
+        await backend.aclose()

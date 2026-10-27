@@ -19,6 +19,7 @@ from nexusrag.services.extraction import extract_pages
 from nexusrag.services.indexing import build_semantic_index
 from nexusrag.services.job_storage import _load_job, load_job, transition_job
 from nexusrag.services.processing_lock import DocumentBusyError, document_lock
+from nexusrag.services.vector_backend import QdrantBackend
 from nexusrag.storage import save_chunks, save_extraction
 
 
@@ -65,13 +66,18 @@ async def _process_document(job_id: UUID) -> None:
         # Create locks within this invocation's event loop. RQ's default worker
         # isolates jobs in child processes, so this does not cache across jobs.
         runtime = EmbeddingRuntime()
-        async with runtime.use_embedder() as embedder:
-            await build_semantic_index(
-                job.document_id,
-                embedder,
-                config.CHUNK_DIRECTORY,
-                config.EMBEDDING_DIRECTORY,
-            )
+        backend = QdrantBackend()
+        try:
+            async with runtime.use_embedder() as embedder:
+                await build_semantic_index(
+                    job.document_id,
+                    embedder,
+                    config.CHUNK_DIRECTORY,
+                    config.EMBEDDING_DIRECTORY,
+                    backend=backend,
+                )
+        finally:
+            await backend.aclose()
     except Exception:
         await transition_job(
             job_id,

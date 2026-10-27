@@ -14,6 +14,7 @@ from nexusrag.database import initialize_database
 from nexusrag.dependencies import (
     get_answer_generator,
     get_embedding_runtime,
+    get_vector_backend,
     require_reindex_lock,
 )
 from nexusrag.schemas.answer import AskDocumentRequest, AskDocumentResponse
@@ -37,6 +38,7 @@ from nexusrag.services.generation_runtime import (
     GenerationUnavailableError,
 )
 from nexusrag.services.job_storage import load_document_job, load_job
+from nexusrag.services.vector_backend import QdrantBackend
 from nexusrag.storage import load_chunks, load_embeddings, load_extraction
 
 logger = logging.getLogger(__name__)
@@ -189,7 +191,7 @@ async def search_document(
         raise HTTPException(422, detail=str(error)) from error
 
     try:
-        record = await load_chunks(document_id, config.CHUNK_DIRECTORY)
+        chunks = await load_chunks(document_id, config.CHUNK_DIRECTORY)
     except FileNotFoundError as error:
         pdf_path = config.STORAGE_DIRECTORY / f"{document_id}.pdf"
         try:
@@ -208,8 +210,9 @@ async def search_document(
 
     try:
         hits = await run_in_threadpool(
-            retrieval.search_chunks, record.chunks, query, limit
+            retrieval.search_chunks, chunks.chunks, query, limit
         )
+
     except Exception as error:
         # This HTTP boundary logs internal failures; the pure ranking function
         # continues to propagate them instead of hiding or skipping invalid hits.
@@ -228,6 +231,7 @@ async def build_document_semantic_index(
     document_id: UUID,
     runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
     _lock: Annotated[None, Depends(require_reindex_lock)],
+    backend: Annotated[QdrantBackend, Depends(get_vector_backend)],
 ) -> SemanticIndexResponse:
     """Create or rebuild saved embeddings without returning vectors or paths."""
     # Validate source availability before loading an expensive optional model.
@@ -258,6 +262,7 @@ async def build_document_semantic_index(
                 embedder,
                 config.CHUNK_DIRECTORY,
                 config.EMBEDDING_DIRECTORY,
+                backend=backend,
             )
             return SemanticIndexResponse(
                 document_id=record.document_id,
@@ -293,6 +298,7 @@ async def semantic_search_document(
     document_id: UUID,
     query: Annotated[str, Query(min_length=1, max_length=500)],
     runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
+    backend: Annotated[QdrantBackend, Depends(get_vector_backend)],
     limit: Annotated[int, Query(ge=1, le=20)] = 5,
 ) -> SemanticSearchResponse:
     """Embed only the query and rank an existing, compatible document index."""
@@ -334,7 +340,7 @@ async def semantic_search_document(
 
     try:
         hits = await search.semantic_search(
-            chunk_record, embedding_record, query, runtime, limit=limit
+            chunk_record, embedding_record, query, runtime, backend=backend, limit=limit
         )
         return SemanticSearchResponse(document_id=document_id, query=query, hits=hits)
     except retrieval.StaleSemanticIndexError as error:
@@ -362,6 +368,7 @@ async def ask_document(
     request: AskDocumentRequest,
     runtime: Annotated[EmbeddingRuntime, Depends(get_embedding_runtime)],
     generator: Annotated[AnswerGenerator, Depends(get_answer_generator)],
+    backend: Annotated[QdrantBackend, Depends(get_vector_backend)],
 ) -> AskDocumentResponse:
     """Answer one question with server-resolved citations to existing PDF chunks."""
     try:
@@ -391,6 +398,7 @@ async def ask_document(
             storage_directory=config.STORAGE_DIRECTORY,
             chunk_directory=config.CHUNK_DIRECTORY,
             embedding_directory=config.EMBEDDING_DIRECTORY,
+            backend=backend,
         )
     except answering.DocumentNotFoundError as error:
         raise HTTPException(404, detail="Document not found") from error

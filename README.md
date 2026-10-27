@@ -419,8 +419,8 @@ failures return a generic `500` with internal details logged.
 Rebuild failures retain the source PDF/chunks and any previous complete index.
 Atomic replacement protects this one JSON file, not a transaction across source
 and index files; search must verify the stored source digest against current chunks.
-Upload and keyword search remain unchanged and do not build embeddings
-automatically.
+Queued uploads build embeddings through the worker. The explicit indexing
+endpoint rebuilds completed documents; keyword search does not build embeddings.
 
 ### Search using embeddings
 
@@ -437,7 +437,9 @@ returns `document_id`, the original `query`, and `hits`. Each hit contains the
 original `chunk` (text, page number, index, and offsets) plus a finite float
 `similarity` between -1 and 1. No vectors or filesystem paths are returned.
 
-Higher similarities rank first, with earlier chunk indices breaking ties.
+Higher similarities rank first, with earlier chunk indices breaking ties among
+the returned hits. Qdrant may select a different subset when equal scores cross
+the top-k boundary.
 Zero and negative similarities are retained: these are nearest passages, not
 guaranteed answers. Empty documents return `hits: []`; unrelated questions can
 still return hits. Keyword `/search` remains a separate baseline.
@@ -783,3 +785,47 @@ waits about two minutes for actual abandonment/registry expiry, and runs recover
 build real embeddings. It does not restart the application broker or call Groq.
 See `docs/queue-validation.md` for the recorded evidence and outstanding manual
 answer/CI checks.
+
+
+### Qdrant indexing publication
+
+Index building now requires Qdrant (`docker compose up -d qdrant`). The API
+supplies a request-owned backend; each RQ task creates and closes its own backend
+within the task's event loop. `build_semantic_index` receives that backend,
+encodes the saved chunks, assigns a fresh `index_generation`, awaits all Qdrant
+writes, and only then atomically saves the local embedding record.
+
+The JSON record still includes vectors for the existing cosine reference and
+identifies the published generation. An upload failure preserves the previous
+record; a local-save failure leaves the new remote generation unreferenced.
+Old generations are retained for now; garbage collection is a separate step.
+Local chunk text remains the citation source. Semantic search and `/ask` now
+use the request-injected Qdrant backend for similarity lookup. The keyword
+`/search` endpoint remains independent of Qdrant. The original Python cosine
+ranker remains available as a reference for offline comparisons, not a silent
+fallback when Qdrant is unavailable.
+
+The queue restart walkthrough uses the real vector adapter with private
+in-memory Qdrant clients in its test workhorses, so it needs no Qdrant server and
+does not modify application collections. It verifies queue/recovery and local
+publication, not Qdrant server persistence.
+
+
+### Semantic retrieval with Qdrant
+
+`GET /documents/{document_id}/semantic-search` and `/ask` share the same service:
+load chunks and the published embedding record, validate source alignment and
+model compatibility, encode only the question, release the model lock, then await
+Qdrant search. Source alignment is owned by this service and is not repeated in
+the adapter. Pydantic validates query/point fields; the adapter checks collection
+compatibility and maps verified returned point identities to local source text.
+
+The query filters document ID, published generation, source digest, model ID,
+and model revision. Exact cosine search is used for baseline parity. No search
+request rebuilds an index or silently switches to local ranking. Legacy embedding
+records without `index_generation` return `409`; explicitly rebuild with
+`POST /documents/{document_id}/semantic-index` before searching or asking.
+Qdrant is required for new indexing and semantic retrieval. Keyword search
+continues to work without it. Start Qdrant and restart the API/worker after this
+update. Client errors and malformed results propagate to the HTTP boundary,
+which returns safe generic errors rather than leaking provider details.

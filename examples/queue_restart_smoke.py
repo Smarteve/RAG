@@ -34,13 +34,25 @@ def paused_task(job_id: str) -> None:
 
 
 def run_worker() -> None:
+    # This walkthrough targets queue/crash behavior, not server persistence.
+    # Use the real adapter with an isolated in-memory client in each workhorse.
+    from qdrant_client import AsyncQdrantClient
     from redis import Redis
     from rq import Queue, Worker
     from rq.serializers import JSONSerializer
 
-    from nexusrag import config
+    from nexusrag import config, tasks
+    from nexusrag.services.vector_backend import QdrantBackend
     from nexusrag.worker_hooks import handle_job_exception, handle_workhorse_killed
 
+    class SmokeVectorBackend(QdrantBackend):
+        def __init__(self):
+            super().__init__(AsyncQdrantClient(":memory:"), collection="restart-smoke")
+
+        async def aclose(self):
+            await self.client.close()
+
+    tasks.QdrantBackend = SmokeVectorBackend
     connection = Redis.from_url(config.REDIS_URL)
     try:
         queue = Queue(

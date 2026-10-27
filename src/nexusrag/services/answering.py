@@ -33,6 +33,7 @@ async def answer_document(
     storage_directory: Path,
     chunk_directory: Path,
     embedding_directory: Path,
+    backend: search.VectorSearchBackend,
 ) -> AskDocumentResponse:
     """Use existing source/index snapshots; never save or rebuild during /ask."""
     question = AskDocumentRequest(question=question).question
@@ -52,7 +53,9 @@ async def answer_document(
             "Semantic index is not available; build it before asking"
         ) from error
 
-    hits = await search.semantic_search(chunks, embeddings, question, runtime, limit=5)
+    hits = await search.semantic_search(
+        chunks, embeddings, question, runtime, backend=backend, limit=5
+    )
     prepared = await run_in_threadpool(
         context.build_context,
         hits,

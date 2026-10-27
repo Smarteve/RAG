@@ -10,11 +10,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nexusrag import config, storage
-from nexusrag.dependencies import get_embedding_runtime
+from nexusrag.dependencies import get_embedding_runtime, get_vector_backend
 from nexusrag.schemas.chunk import DocumentChunk, DocumentChunks
 from nexusrag.schemas.embedding import ChunkEmbedding, DocumentEmbeddings
 from nexusrag.schemas.retrieval import SemanticSearchResponse
-from nexusrag.services import retrieval
 from nexusrag.services.embedding_model import EmbeddingInputError, MiniEmbedder
 from nexusrag.services.embedding_runtime import EmbeddingRuntime
 
@@ -46,7 +45,7 @@ def loader(embedder: Mock) -> Mock:
 
 
 @pytest.fixture
-def client(loader: Mock):
+def client(loader: Mock, vector_search_backend):
     runtime = None
 
     async def dependency():
@@ -55,12 +54,21 @@ def client(loader: Mock):
             runtime = EmbeddingRuntime(loader)
         return runtime
 
+    async def backend_dependency():
+        return vector_search_backend
+
+    previous_backend = main.app.dependency_overrides.get(get_vector_backend)
+    main.app.dependency_overrides[get_vector_backend] = backend_dependency
     previous = main.app.dependency_overrides.get(get_embedding_runtime)
     main.app.dependency_overrides[get_embedding_runtime] = dependency
     try:
         with TestClient(main.app) as test_client:
             yield test_client
     finally:
+        if previous_backend is None:
+            main.app.dependency_overrides.pop(get_vector_backend, None)
+        else:
+            main.app.dependency_overrides[get_vector_backend] = previous_backend
         if previous is None:
             main.app.dependency_overrides.pop(get_embedding_runtime, None)
         else:
@@ -95,6 +103,7 @@ def save_records(
         model_id="test-encoder",
         model_revision="test-v1",
         dimensions=dimensions,
+        index_generation=uuid4(),
         source_digest=sha256(chunks.model_dump_json().encode("utf-8")).hexdigest(),
         embeddings=[
             ChunkEmbedding(chunk_index=index, vector=vector)
@@ -423,32 +432,25 @@ def test_storage_permission_errors_are_generic_500(
     loader.assert_not_called()
 
 
-def test_internal_ranker_failure_is_safe_500(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_backend_failure_is_safe_500(client, vector_search_backend):
     chunks, _ = save_records()
-    monkeypatch.setattr(
-        retrieval,
-        "search_semantic_chunks",
-        Mock(side_effect=ValueError("internal bug")),
-    )
-
+    vector_search_backend.search.side_effect = ValueError("private backend failure")
     response = client.get(
         f"/documents/{chunks.document_id}/semantic-search", params={"query": "leave"}
     )
-
     assert response.status_code == 500
     assert response.json() == {"detail": "Could not search document"}
 
 
-def test_query_encoding_and_ranking_run_in_worker_threads(
-    client: TestClient, embedder: Mock, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_query_encoding_is_offloaded_and_backend_runs_async(
+    client,
+    embedder,
+    monkeypatch,
+    vector_search_backend,
+):
     chunks, embeddings = save_records()
-    request_threads = []
-    worker_threads = []
+    request_threads, worker_threads, backend_threads = [], [], []
     original_load = main.load_chunks
-    original_rank = retrieval.search_semantic_chunks
 
     async def load(*args):
         request_threads.append(get_ident())
@@ -458,23 +460,23 @@ def test_query_encoding_and_ranking_run_in_worker_threads(
         worker_threads.append(get_ident())
         return [1.0, 0.0, 0.0]
 
-    def rank(chunk_record, embedding_record, query_vector, limit):
-        worker_threads.append(get_ident())
-        assert chunk_record == chunks
-        assert embedding_record == embeddings
-        return original_rank(chunk_record, embedding_record, query_vector, limit)
+    async def remote(actual_chunks, actual_embeddings, query_vector, limit):
+        backend_threads.append(get_ident())
+        assert actual_chunks == chunks
+        assert actual_embeddings == embeddings
+        assert query_vector == [1.0, 0.0, 0.0]
+        return []
 
     monkeypatch.setattr(main, "load_chunks", load)
-    monkeypatch.setattr(retrieval, "search_semantic_chunks", rank)
+    vector_search_backend.search.side_effect = remote
     embedder.embed_query.side_effect = encode
-
     response = client.get(
         f"/documents/{chunks.document_id}/semantic-search", params={"query": "leave"}
     )
-
     assert response.status_code == 200
-    assert len(worker_threads) == 2
+    assert len(worker_threads) == 1
     assert set(worker_threads).isdisjoint(request_threads)
+    assert backend_threads == request_threads
 
 
 def test_docs_declare_semantic_response_schema(client: TestClient) -> None:
@@ -485,3 +487,36 @@ def test_docs_declare_semantic_response_schema(client: TestClient) -> None:
     assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/SemanticSearchResponse"
     }
+
+
+def test_legacy_index_requires_rebuild_before_model_or_backend(
+    client, loader, vector_search_backend
+):
+    chunks, embeddings = save_records()
+    embeddings.index_generation = None
+    asyncio.run(storage.save_embeddings(embeddings, config.EMBEDDING_DIRECTORY))
+    response = client.get(
+        f"/documents/{chunks.document_id}/semantic-search", params={"query": "leave"}
+    )
+    assert response.status_code == 409
+    assert "rebuild" in response.json()["detail"]
+    loader.assert_not_called()
+    vector_search_backend.search.assert_not_awaited()
+
+
+def test_query_vector_is_passed_to_backend(client, vector_search_backend, embedder):
+    chunks, embeddings = save_records()
+
+    async def remote_search(actual_chunks, actual_embeddings, query_vector, limit):
+        assert actual_chunks == chunks
+        assert actual_embeddings == embeddings
+        assert query_vector == embedder.embed_query.return_value
+        assert limit == 5
+        return []
+
+    vector_search_backend.search.side_effect = remote_search
+    response = client.get(
+        f"/documents/{chunks.document_id}/semantic-search", params={"query": "leave"}
+    )
+    assert response.status_code == 200
+    vector_search_backend.search.assert_awaited_once()

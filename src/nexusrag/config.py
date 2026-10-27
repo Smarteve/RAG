@@ -48,3 +48,7 @@ EMBEDDING_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 GENERATION_MODEL_ID = "openai/gpt-oss-20b"
 # Source-only budget. Instructions, question, schema, and output have separate room.
 GENERATION_CONTEXT_TOKEN_BUDGET = 2048
+
+
+QDRANT_URL = os.environ.get("NEXUSRAG_QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.environ.get("NEXUSRAG_QDRANT_COLLECTION", "document_vectors")
