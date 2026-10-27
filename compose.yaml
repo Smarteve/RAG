@@ -1,6 +1,23 @@
+# Shared configuration for our three application processes.
+x-app: &app
+  build: .
+  image: nexusrag:dev
+  init: true
+  user: "${LOCAL_UID:?Set LOCAL_UID in .env}:${LOCAL_GID:?Set LOCAL_GID in .env}"
+  restart: unless-stopped
+  stop_grace_period: 4m
+  environment: &app-environment
+    NEXUSRAG_REDIS_URL: redis://redis:6379/0
+    NEXUSRAG_QDRANT_URL: http://qdrant:6333
+    NEXUSRAG_JOB_DATABASE_PATH: /app/data/jobs.sqlite3
+    NEXUSRAG_MODEL_CACHE_DIR: /app/data/models
+  volumes:
+    - ./data:/app/data
+
 services:
   redis:
     image: redis:8-alpine
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
     command:
@@ -18,12 +35,73 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
   qdrant:
     image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: *app-environment
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - |
+          import urllib.request
+          from redis import Redis
+          from nexusrag.config import REDIS_URL, QDRANT_URL
+          Redis.from_url(
+              REDIS_URL,
+              socket_connect_timeout=2,
+              socket_timeout=2,
+          ).ping()
+          urllib.request.urlopen(QDRANT_URL + "/readyz", timeout=2).close()
+          urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2).close()
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  worker:
+    <<: *app
+    command:
+      - /app/.venv/bin/python
+      - -m
+      - nexusrag.run_worker
+    depends_on:
+      api:
+        condition: service_healthy
+
+  sweeper:
+    <<: *app
+    command:
+      - /bin/sh
+      - -c
+      - |
+        trap 'exit 0' TERM INT
+        while :; do
+          /app/.venv/bin/python -m nexusrag.sweep_jobs --apply --max-attempts 3
+          sleep 60 &
+          wait $$!
+        done
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   redis_data:

@@ -42,84 +42,163 @@ offline with fake providers; real-model answer quality still needs manual evalua
 The first RAG milestone is answering a question about one text-based PDF with a
 supporting page citation, not a guarantee of factual correctness.
 
-## Run locally
+## Run with Docker Compose
 
-Supported setup: Linux with Python 3.15.0 and uv 0.13.0. The lockfile resolves
-Linux dependencies only; macOS and Windows are not supported by this setup.
-`uv sync` installs the pinned interpreter if needed and creates `.venv`.
-CI and Docker use the same Python version.
+Supported setup: Linux with Docker Engine and the Docker Compose plugin
+(`docker compose version`). The Docker build uses Python 3.15.0 and uv 0.13.0
+to install the locked runtime dependencies, including the embeddings and generation extras.
+You do not need a host Python environment to run the application. Local
+development and CI use the same Python version; the lockfile resolves Linux
+dependencies only.
 
-### Start Redis, the worker, and the API
+Run all commands below from the project root. Compose manages five services:
 
-Run these commands from the project root. Redis runs in Docker; the Python API
-and RQ worker run locally in separate terminals.
+| Service | Purpose |
+| --- | --- |
+| `api` | FastAPI on <http://127.0.0.1:8000> |
+| `worker` | RQ worker with application failure hooks |
+| `sweeper` | Guarded recovery, delivery reconciliation, and eligible retries |
+| `redis` | Persistent job queue |
+| `qdrant` | Persistent vector database |
 
-Before the first run, install the optional processing/generation dependencies:
+The API, worker, and sweeper use the same locally built `nexusrag:dev` image with
+different commands. `x-app` in `compose.yaml` is shared configuration, not another
+service. Containers connect to `redis://redis:6379/0` and `http://qdrant:6333` using
+Compose service names; `localhost` inside a container refers to that container.
+
+### First-time setup
+
+1. Find your user and group IDs:
+
+   ```bash
+   id -u
+   id -g
+   ```
+
+   Create or edit the ignored project-root `.env`. Replace `1000` below with the
+   respective values above, and supply your Groq key if you want to use `/ask`:
+
+   ```dotenv
+   LOCAL_UID=1000
+   LOCAL_GID=1000
+   GROQ_API_KEY=
+   ```
+
+   Compose runs application containers with these IDs so they can write into
+   your existing `data` directory. It passes the Groq key only to the API.
+   Document processing does not call Groq. Keep credentials out of Git.
+
+2. Prepare shared storage, validate configuration, and build the image:
+
+   ```bash
+   mkdir -p data/models
+   docker compose config --quiet
+   docker compose build api
+   ```
+
+3. Cache the pinned MiniLM model. Skip this if the existing `data/models` cache
+   already works. This temporary container downloads the model into the shared
+   folder and exits; it does not start the other services:
+
+   ```bash
+   docker compose run --rm --no-deps -T api /app/.venv/bin/python - <<'PY'
+   from sentence_transformers import SentenceTransformer
+   from nexusrag import config
+
+   model = SentenceTransformer(
+       config.EMBEDDING_MODEL_ID,
+       revision=config.EMBEDDING_MODEL_REVISION,
+       device="cpu",
+       cache_folder=str(config.EMBEDDING_MODEL_CACHE_DIRECTORY),
+       trust_remote_code=False,
+       model_kwargs={"use_safetensors": True},
+   )
+   print("Cached model dimensions:", model.get_sentence_embedding_dimension())
+   PY
+   ```
+
+   Expect 384 dimensions. Network access is required for the initial download;
+   normal API requests and worker tasks load only cached model files.
+
+### Migrate from local processes
+
+If you previously ran Uvicorn and the worker in terminals, stop them with Ctrl+C.
+If you installed the user systemd sweeper, disable its timer and stop any active
+pass before starting the Compose sweeper:
 
 ```bash
-uv sync --locked --extra embeddings --extra generation
+systemctl --user disable --now nexusrag-sweep.timer
+systemctl --user stop nexusrag-sweep.service
 ```
 
-Cache MiniLM using the instructions under [Try local MiniLM embeddings](#try-local-minilm-embeddings).
-For `/ask`, put `GROQ_API_KEY` in your local `.env` as described under
-[Ask a question and receive an answer](#ask-a-question-and-receive-an-answer).
-Document processing itself does not call Groq.
+These systemd commands are unnecessary if you never installed those units.
+Use one scheduler for this database. Keep the existing `data` folder and the
+Redis/Qdrant named volumes; use the same Compose project name to retain access
+to the existing named volumes.
 
-1. Start the Redis container in the background:
+### Start and try the full flow
 
-   ```bash
-   docker compose up -d redis
-   docker compose ps
-   docker compose exec redis redis-cli ping
-   ```
+```bash
+docker compose up -d --wait
+docker compose ps
+```
 
-   Expect `PONG`. If Redis is already healthy, leave it running.
+`-d` runs containers in the background. `--wait` waits for services to be running
+or healthy. The worker and sweeper start after the API health check confirms
+the API, Redis, and Qdrant are reachable. This check does not validate the model
+cache or Groq credentials.
 
-2. Start the worker in terminal 1 and leave it running:
+Open <http://127.0.0.1:8000/docs> and try the flow:
 
-   ```bash
-   uv run --no-sync python -m nexusrag.run_worker
-   ```
+1. Execute `POST /documents` with `examples/employee-handbook.pdf`.
+2. Copy `job_id` and `document_id` from **Server response → Response body**,
+   not the static **Example Value**.
+3. Execute `GET /jobs/{job_id}` repeatedly until `succeeded` or `failed`.
+   A successful job moves through `queued → running → succeeded`.
+4. Once it succeeds, execute `POST /documents/{document_id}/ask` with a question.
+   Use the document ID for `/ask`, and the job ID for status checks.
+5. If processing fails, inspect `docker compose logs --tail=100 worker`.
+   Asking while queued, running, or failed returns `409` with the job ID and status.
 
-   This creates an RQ worker, initializes SQLite, and registers our exception
-   and killed-workhorse hooks. It listens for tasks on the configured queue;
-   you do not restart it for each upload. Use this command instead of a plain
-   `rq worker` command so the application hooks are registered.
+The worker stays running and consumes subsequent uploads; no manual worker
+startup is needed. If it stops, accepted jobs remain queued until a worker
+consumes them. The sweeper starts automatically too: it runs an apply pass
+immediately, then waits 60 seconds after each pass before running again, with
+a three-attempt limit including the initial attempt. Only failures classified
+as interrupted processing qualify for automatic retries.
 
-3. Start the API in terminal 2 and leave it running:
+### Logs, updates, and shutdown
 
-   ```bash
-   uv run --env-file .env --no-sync uvicorn nexusrag.main:app --reload
-   ```
+Follow application logs (Ctrl+C stops following, leaving containers running):
 
-   If you only want to upload/process documents and do not have a `.env`, omit
-   `--env-file .env`. `--no-sync` preserves the extras installed above.
+```bash
+docker compose logs -f api worker sweeper
+```
 
-4. Open <http://127.0.0.1:8000/docs> and try the flow:
+Source code is copied into the image, so rebuild after changing Python code or
+dependencies. This also recreates services when their configuration changes:
 
-   - Execute `POST /documents` with `examples/employee-handbook.pdf`.
-   - Copy `job_id` and `document_id` from **Server response → Response body**,
-     not the static **Example Value**.
-   - Execute `GET /jobs/{job_id}` repeatedly until `succeeded` or `failed`.
-     A successful job moves through `queued → running → succeeded`.
-   - Once it succeeds, execute `POST /documents/{document_id}/ask` with a question.
-     Use the document ID for `/ask`, and the job ID for status checks.
-   - If processing fails, inspect the worker terminal. Asking while queued,
-     running, or failed returns `409` with the job ID and status.
+```bash
+docker compose up --build -d --wait
+```
 
-The worker and API can start in either order after Redis; both must be running
-for the complete upload-to-answer flow. If the worker is stopped, accepted jobs
-remain queued until a worker consumes them.
+After changing only `GROQ_API_KEY` in `.env`, recreate the API with
+`docker compose up -d --wait api`; `docker compose restart api` does not load new
+environment values. Compose reads `.env` for interpolation and explicitly passes
+the configured variables; it does not inject every `.env` entry into containers.
 
-Stop the API and worker with Ctrl+C in their terminals. Stop Redis with:
+Stop and remove the containers while preserving stored data:
 
 ```bash
 docker compose down
 ```
 
-The named `redis_data` volume retains Redis persistence files. Avoid
-`docker compose down -v` unless you intend to delete those files. Redis uses AOF
-with once-per-second syncing; a sudden crash can lose recent writes.
+`./data:/app/data` shares PDFs, extracted text, chunks, embedding records, SQLite,
+the model cache, and document locks across application containers. Redis uses
+the `redis_data` named volume; Qdrant uses `qdrant_data`. Avoid
+`docker compose down -v` unless you intend to delete the named volumes. Redis
+uses AOF with once-per-second syncing; a sudden crash can lose recent writes.
+These mounts preserve data across container replacement, but are not backups.
 
 ### Queue behavior and storage
 
@@ -128,9 +207,10 @@ and submits its ID to RQ through Redis. It returns `202 Accepted` with
 `document_id`, `job_id`, and `status: "queued"`. Acceptance does not mean the
 PDF has been extracted or indexed. The worker executes `nexusrag.tasks.process_document`.
 
-The API and worker must share the configured database, source directories, and
-cached local embedding model. Defaults use `data/jobs.sqlite3`, queue `ingestion`,
-and Redis at `redis://localhost:6379/0`. Environment overrides are
+The API, worker, and sweeper share the configured database, source directories,
+document locks, and cached local embedding model through `/app/data` in Compose.
+The queue defaults to `ingestion`. Outside Docker, defaults use
+`data/jobs.sqlite3` and Redis at `redis://localhost:6379/0`. Environment overrides are
 `NEXUSRAG_JOB_DATABASE_PATH`, `NEXUSRAG_INGESTION_QUEUE_NAME`, and
 `NEXUSRAG_REDIS_URL`. The worker startup command reads these settings too.
 
@@ -153,10 +233,9 @@ only when SQLite still says running. Queued and terminal records remain unchange
 Rejected claims do not fail a different execution. SQLite recovery errors are
 logged without exception details and do not block RQ's normal failure handling.
 A plain `rq worker` command does not register these application hooks. Whole-worker
-or machine loss needs the reconciliation pass described below; periodic scheduling
-is not implemented.
-Automatic retries remain disabled; execution ownership for retries must be
-specified before enabling them.
+or machine loss needs the guarded reconciliation pass described below. Compose
+runs it periodically in the `sweeper` service and retries eligible interruptions
+up to three total attempts. RQ's own automatic retries remain disabled.
 
 The same UUID links the original and extracted data:
 
@@ -196,7 +275,8 @@ it does not guarantee durability across power loss.
 Worker processing failures retain the source PDF and mark the job `failed`
 with a safe public error. Partial extraction/chunk artifacts may remain, but
 success is recorded only after indexing finishes. Each index JSON is published
-atomically. Automatic retries and whole-worker interruption recovery are not implemented.
+atomically. The sweeper recovers confirmed interruptions and creates eligible
+retries; generic processing failures require investigation.
 Upload metadata is validated but is not persisted or returned. OCR is not
 implemented. `/ask` checks the document processing job before retrieval. Queued, running,
 and failed jobs return `409` with a safe message, job ID, and status. Successful
@@ -310,27 +390,29 @@ record and scores every chunk; `limit` bounds returned hits, not processing work
 It searches only the requested document. Try `annual leave` against the included
 sample handbook to retrieve supporting passages with page references.
 
-To choose other directories, set the environment variables before starting:
+For a host development server, choose other directories by setting environment
+variables before starting:
 
 ```bash
 NEXUSRAG_STORAGE_DIR=/tmp/nexusrag-documents \
 NEXUSRAG_EXTRACTION_DIR=/tmp/nexusrag-extracted \
 NEXUSRAG_CHUNK_DIR=/tmp/nexusrag-chunks \
-uv run uvicorn nexusrag.main:app --reload
+uv run --no-sync uvicorn nexusrag.main:app --reload
 ```
 
 Relative storage paths are resolved from the working directory at startup.
-Local `data/` is ignored by Git. In Docker, mount a volume at `/app/data` (or
-separate volumes at `/app/data/documents`, `/app/data/extracted`, and
-`/app/data/chunks`) to keep originals and results when replacing the container.
-All three directories must be
-writable by the container user (UID 10001).
+Local `data/` is ignored by Git. Compose already mounts the complete folder at
+`/app/data` and overrides the image's default UID 10001 with `LOCAL_UID:LOCAL_GID`.
+To customize paths in Docker, update the shared environment and volume mappings
+in `compose.yaml` for all application services. Adding a variable to `.env` alone
+does not pass it into a container unless Compose references it.
 
 ## Try local MiniLM embeddings
 
-Embeddings are an optional extra. Ordinary API startup, uploads, keyword search,
-and normal CI do not load a model. The Docker image does not install the extra.
-Install it locally and explicitly download/cache the model using the demo:
+The Docker image includes the embeddings extra; see
+[First-time setup](#first-time-setup) to cache the model in Docker. The experiment
+below is optional and runs in a host Python environment. For local development,
+install the extra and explicitly download/cache the model using the demo:
 
 ```bash
 uv sync --locked --extra embeddings --dev
@@ -379,17 +461,17 @@ worker-thread pattern as chunk storage. Override the directory with
 `NEXUSRAG_EMBEDDING_DIR`; storage functions still receive the directory explicitly.
 Loading validates the schema and document ID. The semantic retrieval caller must
 also check model compatibility and the source digest against current chunks.
-Failed writes preserve any previous complete record; no database is required.
-The Dockerfile prepares this directory for the non-root app user, but does not
-install the optional embedding dependencies or load a model.
+Failed writes preserve any previous complete record. Qdrant stores the searchable
+vectors; the local JSON record identifies the published generation. The image
+installs embedding dependencies but does not contain model weights; Compose
+shares the separately populated `data/models` cache.
 
 ### Build a document's semantic index
 
-After installing the extra and running the demo, start the server without
-removing the optional packages:
+With the model cache prepared, start the Compose stack:
 
 ```bash
-uv run --no-sync uvicorn nexusrag.main:app --reload
+docker compose up -d --wait
 ```
 
 Upload a PDF, copy its document ID, and use this operation in `/docs`:
@@ -455,30 +537,31 @@ serialized runtime as index building. Searches do not change saved records.
 ### Ask a question and receive an answer
 
 Use semantic retrieval only for answers; keyword search remains a separate
-baseline. Install both optional extras and cache MiniLM as above. Put your Groq
-key in a local project-root `.env` file; paste its value after the equals sign:
+baseline. The Docker image includes both required extras; cache MiniLM as above.
+Put your Groq key in the existing project-root `.env`, alongside `LOCAL_UID` and
+`LOCAL_GID`; paste its value after the equals sign:
 
 ```dotenv
 GROQ_API_KEY=
 ```
 
-Start the server from the project root with explicit environment-file loading:
+Start or recreate the API from the project root so it receives the configured key:
 
 ```bash
-uv sync --locked --extra embeddings --extra generation
-uv run --env-file .env --no-sync uvicorn nexusrag.main:app --reload
+docker compose up -d --wait api
 ```
 
-`uv --env-file` loads the file into the launched process's environment, so Python
-still reads the key through `os.environ`; no dotenv dependency is needed in the
-application. `.env` and `.env.*` are excluded from Git and Docker build context
-(except a future nonsecret `.env.example`). Do not force-add credentials to Git.
-The prepared `.env` starts with an empty key; fill it locally before asking.
-Existing exported environment variables take precedence: if an older key is
-still exported, run `unset GROQ_API_KEY` before starting to use the file's value.
-Restart the server after changing credentials. See the
-[uv environment-file option](https://docs.astral.sh/uv/reference/cli/#uv-run--env-file).
-To run the connection test with the same file, use
+Compose passes the key into the API process's environment; Python reads it through
+`os.environ`. `.env` and `.env.*` are excluded from Git and Docker build context
+(except a nonsecret `.env.example`, if added). Do not force-add credentials to Git.
+Exported shell variables take precedence over Compose's `.env`; if an older key
+is exported, run `unset GROQ_API_KEY` before recreating the API.
+
+For an optional host development server, install the extras with
+`uv sync --locked --extra embeddings --extra generation` and launch with
+`uv run --env-file .env --no-sync uvicorn nexusrag.main:app --reload` instead of
+the API container. `uv --env-file` explicitly loads credentials for that process.
+To run the optional host connection test with the same file, use
 `uv run --env-file .env --no-sync python examples/groq_smoke.py`.
 Stay on Groq's free tier if you want no usage charges. Quotas are limited and
 account-specific; upgrading billing changes the cost. See
@@ -549,10 +632,10 @@ The Groq SDK is imported lazily; each provider call owns/closes its client, has
 a 30-second request timeout, and disables automatic retries and model fallback.
 Other endpoints still work without the generation extra or key.
 
-Keep this learning API bound to localhost. Authentication, application rate
-limiting, and production deployment controls are not implemented. The existing
-Docker image does not install the optional model/provider extras; /ask is not
-ready in that image without a separate container setup update.
+Keep this learning API bound to localhost, as configured in Compose.
+Authentication, application rate limiting, and production deployment controls
+are not implemented. Docker includes the model/provider dependencies; `/ask`
+also requires the cached model, an indexed document, and a working Groq key.
 
 ## Code responsibilities
 
@@ -610,8 +693,9 @@ jobs with no execution records qualify. Locked documents, stale/missing heartbea
 missing RQ records, Redis outages, and changed job records are left unchanged.
 The result reports `recovery_action` as `none`, `skipped`, or `failed`.
 
-Restart all workers with `uv run --no-sync python -m nexusrag.run_worker` before
-using apply mode: older workers do not participate in document locking. Task
+After updating worker code, rebuild and recreate the stack with
+`docker compose up --build -d --wait` before using apply mode: older workers may
+not participate in document locking. Task
 entry points hold `.job-locks/<document_id>.lock` beside the configured database
 through processing and publication. Recovery uses the same lock. A paused or
 orphaned child keeps ownership; process death releases it. Do not delete lock
@@ -643,18 +727,17 @@ running jobs, while `job_retry.py` owns retry policy and submission.
 
 ### Run one recovery and retry sweep
 
-Start the API or worker once to initialize the database and indexes, and restart
-older workers so all executions participate in document locking. From the project
-root, preview a single pass:
+The Compose sweeper already runs apply passes automatically. To inspect a single
+dry run using the running API container's settings and shared storage:
 
 ```bash
-uv run --no-sync python -m nexusrag.sweep_jobs
+docker compose exec api /app/.venv/bin/python -m nexusrag.sweep_jobs
 ```
 
 Apply guarded recovery and enqueue eligible failed attempts:
 
 ```bash
-uv run --no-sync python -m nexusrag.sweep_jobs --apply --max-attempts 3
+docker compose exec api /app/.venv/bin/python -m nexusrag.sweep_jobs --apply --max-attempts 3
 ```
 
 The command reports JSON lines for inspection, proposed/enqueued retries, skips,
@@ -666,10 +749,28 @@ do not simulate retries for running jobs that would first require recovery.
 Queue submission errors report the retained queued attempt ID. Existing queued
 attempts are checked by delivery reconciliation and resubmitted only when RQ
 is absent, preserving the same job ID and attempt number.
-No timer or infinite loop is installed by this command. Schedule it only after
-manually verifying its decisions in this environment.
+The Python command performs one pass and exits. Repetition is supplied by the
+Compose sweeper's shell loop, which starts immediately, then sleeps 60 seconds
+after each completed pass. A nonzero pass exit is reported in logs and the loop
+continues. Use `docker compose logs -f sweeper` to follow scheduled results.
 
-### Schedule the sweep with a user systemd timer
+To pause scheduled sweeps and resume them later:
+
+```bash
+docker compose stop sweeper
+docker compose start sweeper
+```
+
+For an installation outside Docker, initialize the database by starting the API
+or worker first, then use `uv run --no-sync python -m nexusrag.sweep_jobs` with
+the same flags and matching storage/Redis settings.
+
+### Alternative: schedule a host sweeper with systemd
+
+This is an alternative for running Python processes outside Docker. It is not
+required for the Compose stack. Do not enable this timer alongside the Compose
+`sweeper` service for the same database. The full Docker workflow starts its
+sweeper with `docker compose up -d --wait` and does not run the installer below.
 
 The tracked service template and timer live in `deploy/systemd/`. The installer
 generates a service using this checkout's absolute path and the `uv` executable
@@ -743,8 +844,8 @@ exit code and a safe diagnostic for operator review.
 
 Restart the API and all workers after updating: workers now wait on document
 locks so a task received during the short delivery lock is not rejected. Recovery
-and sweeps still acquire locks nonblocking. The existing systemd timer command
-runs this phase automatically; its unit files do not need to change.
+and sweeps still acquire locks nonblocking. The Compose sweeper runs this phase
+automatically; the alternative host systemd service invokes the same command.
 
 Optional integration tests use generated private queues and clean them afterward:
 
@@ -789,7 +890,7 @@ answer/CI checks.
 
 ### Qdrant indexing publication
 
-Index building now requires Qdrant (`docker compose up -d qdrant`). The API
+Index building requires Qdrant, started with the rest of the Compose stack. The API
 supplies a request-owned backend; each RQ task creates and closes its own backend
 within the task's event loop. `build_semantic_index` receives that backend,
 encodes the saved chunks, assigns a fresh `index_generation`, awaits all Qdrant
@@ -826,6 +927,7 @@ request rebuilds an index or silently switches to local ranking. Legacy embeddin
 records without `index_generation` return `409`; explicitly rebuild with
 `POST /documents/{document_id}/semantic-index` before searching or asking.
 Qdrant is required for new indexing and semantic retrieval. Keyword search
-continues to work without it. Start Qdrant and restart the API/worker after this
-update. Client errors and malformed results propagate to the HTTP boundary,
-which returns safe generic errors rather than leaking provider details.
+continues to work without it. Rebuild and recreate the stack after code updates
+with `docker compose up --build -d --wait`. Client errors and malformed results
+propagate to the HTTP boundary, which returns safe generic errors rather than
+leaking provider details.

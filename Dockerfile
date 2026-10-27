@@ -19,10 +19,10 @@ RUN apt-get update \
 # Install locked runtime dependencies first. This layer is reused when only
 # application code changes.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project --extra embeddings --extra generation
 
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable
+RUN uv sync --frozen --no-dev --no-editable --extra embeddings --extra generation
 
 FROM python:3.15.0-slim AS runtime
 
