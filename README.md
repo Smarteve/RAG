@@ -167,6 +167,60 @@ immediately, then waits 60 seconds after each pass before running again, with
 a three-attempt limit including the initial attempt. Only failures classified
 as interrupted processing qualify for automatic retries.
 
+### Develop with live source code
+
+After the first-time setup above, start the stack with the development override:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d --wait
+```
+
+`compose.dev.yaml` mounts `./src` read-only at `/app/src` in the API, worker, and
+sweeper. It sets `PYTHONPATH=/app/src` so Python imports your current source
+instead of the package copy installed in the image. The existing shared data,
+dependencies, and service settings are retained. No rebuild is needed for
+ordinary Python source edits.
+
+| Change | Action in development mode |
+| --- | --- |
+| API code under `src/` | Uvicorn reloads automatically |
+| Worker/task code, hooks, or shared processing code | Restart the worker |
+| Sweep implementation | The next pass starts a new Python process and loads the current source |
+| Dependencies (`pyproject.toml`, `uv.lock`) or Dockerfile | Rebuild the application image and recreate services |
+| Compose settings or `.env` values referenced by Compose | Run the development startup command again to recreate affected services |
+
+After changing worker code, restart the worker so its parent process and future
+task children load the updated modules:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml restart worker
+```
+
+The worker receives a graceful stop request; an active job may finish before the
+restart completes. Restart it before submitting jobs that should use the new
+code. Shared modules used by both the API and worker require this worker restart
+even though the API reloads automatically. For database initialization changes,
+allow the API reload to finish and restart the worker before continuing.
+
+For dependency or Dockerfile changes:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up --build -d --wait
+```
+
+Keep both `-f` options on subsequent development commands. For example:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml logs -f api worker sweeper
+docker compose -f compose.yaml -f compose.dev.yaml down
+```
+
+For other Compose commands elsewhere in this README, add the same two `-f`
+options before the subcommand when using development mode. Running `up` with
+only `compose.yaml` switches services back to the built-image configuration.
+The override follows [Compose's file merging rules](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)
+and enables [Uvicorn's development reloader](https://uvicorn.dev/settings/#development).
+
 ### Logs, updates, and shutdown
 
 Follow application logs (Ctrl+C stops following, leaving containers running):
@@ -175,8 +229,10 @@ Follow application logs (Ctrl+C stops following, leaving containers running):
 docker compose logs -f api worker sweeper
 ```
 
-Source code is copied into the image, so rebuild after changing Python code or
-dependencies. This also recreates services when their configuration changes:
+With `compose.yaml` alone, source code is copied into the image, so rebuild after
+changing Python code or dependencies. For live source edits, use the development
+override above instead. This command rebuilds the base configuration and
+recreates services when their configuration changes:
 
 ```bash
 docker compose up --build -d --wait
