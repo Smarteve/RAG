@@ -23,20 +23,26 @@ class MiniEmbedder:
             raise ValueError("model must report a positive integer embedding dimension")
         return dimensions
 
+    def get_token_limit(self) -> int:
+        limit = self.model.max_seq_length
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("model must report a positive integer token limit")
+        return limit
+
+    def count_tokens(self, text: str) -> int:
+        """Count an exact source substring with the embedding tokenizer."""
+        encoded = self.model.tokenizer(text, add_special_tokens=True, truncation=False)
+        return len(encoded["input_ids"])
+
     def embed_query(self, query: str) -> list[float]:
         if not query.strip():
             raise EmbeddingInputError("query must not be blank")
 
-        encoded = self.model.tokenizer(
-            query,
-            add_special_tokens=True,
-            truncation=False,
-        )
-
-        token_count = len(encoded["input_ids"])
-        if token_count > self.model.max_seq_length:
+        token_count = self.count_tokens(query)
+        token_limit = self.get_token_limit()
+        if token_count > token_limit:
             raise EmbeddingInputError(
-                f"query has {token_count} tokens; limit is {self.model.max_seq_length}"
+                f"query has {token_count} tokens; limit is {token_limit}"
             )
 
         query_vector = self.model.encode_query(
@@ -63,12 +69,12 @@ class MiniEmbedder:
             add_special_tokens=True,
             truncation=False,
         )
+        token_limit = self.get_token_limit()
         for index, token_ids in enumerate(encoded["input_ids"]):
             token_count = len(token_ids)
-            if token_count > self.model.max_seq_length:
+            if token_count > token_limit:
                 raise EmbeddingInputError(
-                    f"document {index} has {token_count} tokens; "
-                    f"limit is {self.model.max_seq_length}"
+                    f"document {index} has {token_count} tokens; limit is {token_limit}"
                 )
 
         vectors = self.model.encode_document(

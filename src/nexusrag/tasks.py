@@ -55,20 +55,24 @@ async def _process_document(job_id: UUID) -> None:
         pages = await run_in_threadpool(extract_pages, pdf_path)
         extraction = DocumentExtraction(document_id=job.document_id, pages=pages)
         await save_extraction(extraction, config.EXTRACTION_DIRECTORY)
-        chunks = DocumentChunks(
-            document_id=job.document_id,
-            chunk_size=DEFAULT_CHUNK_SIZE_CHARS,
-            overlap=DEFAULT_CHUNK_OVERLAP_CHARS,
-            chunks=await run_in_threadpool(chunk_document, extraction),
-        )
-        await save_chunks(chunks, config.CHUNK_DIRECTORY)
-
         # Create locks within this invocation's event loop. RQ's default worker
         # isolates jobs in child processes, so this does not cache across jobs.
         runtime = EmbeddingRuntime()
         backend = QdrantBackend()
         try:
             async with runtime.use_embedder() as embedder:
+                chunks = DocumentChunks(
+                    document_id=job.document_id,
+                    chunk_size=DEFAULT_CHUNK_SIZE_CHARS,
+                    overlap=DEFAULT_CHUNK_OVERLAP_CHARS,
+                    chunks=await run_in_threadpool(
+                        chunk_document,
+                        extraction,
+                        count_tokens=embedder.count_tokens,
+                        max_tokens=embedder.get_token_limit(),
+                    ),
+                )
+                await save_chunks(chunks, config.CHUNK_DIRECTORY)
                 await build_semantic_index(
                     job.document_id,
                     embedder,

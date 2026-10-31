@@ -345,9 +345,27 @@ Extraction JSON contains `document_id`, `status`, `error`, and `pages` (objects
 with `page_number` and `text`). Chunk JSON contains `document_id`, `chunk_size`,
 `overlap`, and `chunks`. Each chunk keeps its document ID, zero-based chunk index,
 one-based page number, exact text, and page-local `[start_char:end_char]` offsets.
-The defaults are 1000 Python string characters per window with 200-character
-overlap, not byte or token counts. Whitespace-only pages are skipped without
-renumbering later pages; chunk text is not stripped.
+The defaults remain a cap of 1000 Python string characters per chunk and a
+requested 200-character overlap. New queued uploads also fit each chunk to the
+loaded MiniLM model's token limit. The worker passes the model's token counter
+into `chunk_document`; it counts each candidate substring with special tokens
+and truncation disabled, shortening the character span until it fits. Overlap
+is reduced when a fitted chunk is too short for the requested overlap, ensuring
+the next window advances. Whitespace-only pages/windows are skipped without
+renumbering later pages; emitted chunk text is not stripped.
+
+`chunk_size`, `overlap`, `start_char`, and `end_char` still use character units;
+the saved chunk schema is unchanged. Calling `chunk_document` without a token
+counter/budget retains the original character-window behavior for the local
+baseline and ingestion helper. Existing saved documents are not automatically
+rechunked. Upload a fresh copy to use the new chunking; the semantic-index
+endpoint rebuilds vectors from saved chunks and does not change their boundaries.
+
+The task child loads the model once, then uses the same tokenizer/model for
+splitting and embedding. Tokenization and splitting run in a worker thread.
+The embedding boundary still checks complete chunks before encoding, so legacy
+or externally supplied oversized chunks fail explicitly rather than being
+silently truncated.
 
 Storage functions are async wrappers around synchronous worker-thread helpers.
 All writes use a uniquely named temporary
@@ -532,9 +550,11 @@ See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/
 
 MiniLM outputs 384 values per vector and has a default 256-token input limit.
 The demo checks the tokenizer's count, including special tokens, and rejects
-oversized inputs before encoding instead of accepting silent truncation. Our
-1000-character chunk size does not guarantee that every chunk fits. MiniLM does
-not need BGE/E5 query prefixes. See the [model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
+oversized inputs before encoding instead of accepting silent truncation. A
+1000-character cap alone does not guarantee that every chunk fits; new queued
+uploads now additionally fit chunks with this tokenizer. Existing saved chunks
+retain their original boundaries. MiniLM does not need BGE/E5 query prefixes.
+See the [model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
 
 After the first successful download, you can check that the model works offline:
 
@@ -589,8 +609,9 @@ process, with loading and inference offloaded and serialized. Multiple server
 processes each have their own model and lock; document ingestion uses a separate RQ worker.
 
 Invalid UUIDs return `422`, unknown documents `404`, and PDFs without available
-chunks `409`. Blank or over-token-budget chunk text also returns `409`; adjust
-chunking rather than silently truncating. Unavailable optional packages or cached
+chunks `409`. Blank or over-token-budget saved chunk text also returns `409`.
+For oversized legacy chunks, upload a fresh copy to use token-aware chunking;
+this endpoint does not rechunk stored text. Unavailable optional packages or cached
 model files return a safe `503`. Corrupt records, invalid model output, or storage
 failures return a generic `500` with internal details logged.
 
@@ -732,6 +753,70 @@ Keep this learning API bound to localhost, as configured in Compose.
 Authentication, application rate limiting, and production deployment controls
 are not implemented. Docker includes the model/provider dependencies; `/ask`
 also requires the cached model, an indexed document, and a working Groq key.
+
+## Evaluate retrieval
+
+The evaluator asks fixed questions against an already indexed document using the
+same semantic-search service as the API. It measures retrieval only: it does not
+call Groq, generate answers, ingest/reindex documents, or change job states.
+The default [case set](src/nexusrag/evaluation_cases.py) has seven answerable
+handbook questions and one unsupported parking question.
+
+Upload `examples/employee-handbook.pdf`, wait for its job to succeed, and replace
+`YOUR_DOCUMENT_ID` with the actual document ID in this command:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml exec api \
+  /app/.venv/bin/python -m nexusrag.evaluate_retrieval YOUR_DOCUMENT_ID \
+  --output /app/data/evaluations/handbook-token-aware.json
+```
+
+Development mode loads the new evaluator from the mounted source. With the base
+Compose configuration alone, rebuild first and omit the two `-f` options.
+`--output` saves the complete report to the host's
+`data/evaluations/handbook-token-aware.json` and prints a JSON summary. Omit it to
+print the full report instead. Use different filenames to retain separate runs.
+
+- **Hit@5** (`hit_rate_at_k`): the fraction of answerable questions with at least
+  one supporting passage among the first five hits.
+- **MRR@5** (`mrr_at_k`): the average reciprocal of the first relevant rank. Rank
+  1 contributes 1, rank 2 contributes 0.5, and a miss contributes 0.
+- Each case records `first_relevant_rank`, the expected passages, and the actual
+  returned chunks, pages, character offsets, and similarity scores.
+
+A hit is relevant when it contains an expected phrase on the expected page;
+matching ignores case and normalizes whitespace. Multiple expected passages in
+a case are alternative acceptable matches. Unsupported cases retain their hits
+for inspection but are excluded from both scored denominators. Nearby passages
+for an unsupported question do not demonstrate answer support or correct model
+abstention. Answer/citation quality still requires separate manual evaluation.
+
+The report also records the dataset ID, PDF SHA-256, source digest, published
+generation, model identity/revision, chunk settings/count, top-k, and timestamp.
+The PDF must match the case set's fingerprint, and positive labels must occur on
+their annotated source pages. Invalid inputs, stale indexes, and operational
+failures abort the run instead of silently omitting cases. Exit code 0 means the
+run completed, even if retrieval missed every expected passage; it is not a
+quality threshold. Failures exit nonzero; input/search failures occur before
+report output is written.
+
+The evaluator holds the document lock while reading/searching to keep deletion
+and reindexing from changing its snapshot. Queued, running, failed, or deleted
+documents cannot be evaluated. Existing legacy documents without job records can
+be evaluated when their artifacts form a compatible published index.
+
+Use `--top-k 1` for a stricter first-result check. To compare saved documents from
+different chunking versions, evaluate their respective IDs with the same case
+set, model, and top-k, saving separate reports. The evaluator never rebuilds the
+baseline. Custom labels can be supplied with `--cases /app/data/evaluations/cases.json`,
+using the `RetrievalDataset` schema and that PDF's SHA-256.
+
+The [recorded local baseline](docs/retrieval-evaluation.md) compares character
+and token-aware chunks with the cached model and private in-memory Qdrant. The
+small handbook produces only two chunks, so Hit@5 can include the whole document;
+high scores here are a regression baseline, not evidence of general retrieval
+quality or improved chunking. Add harder, longer documents before drawing those
+conclusions.
 
 ## Code responsibilities
 

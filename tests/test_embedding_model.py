@@ -154,6 +154,31 @@ def test_dimensions_are_read_from_loaded_model() -> None:
     model.get_sentence_embedding_dimension.assert_called_once_with()
 
 
+def test_count_tokens_uses_exact_text_special_tokens_and_no_truncation() -> None:
+    model = make_model([], [])
+    model.tokenizer.return_value = {"input_ids": [101, 7, 8, 102]}
+    assert make_embedder(model).count_tokens("  中文 café  ") == 4
+    model.tokenizer.assert_called_once_with(
+        "  中文 café  ", add_special_tokens=True, truncation=False
+    )
+    model.encode_document.assert_not_called()
+    model.encode_query.assert_not_called()
+
+
+def test_token_limit_comes_from_loaded_model() -> None:
+    model = make_model([], [])
+    model.max_seq_length = 17
+    assert make_embedder(model).get_token_limit() == 17
+
+
+@pytest.mark.parametrize("limit", [None, 0, -1, 1.5, "256", True])
+def test_invalid_model_token_limit_is_rejected(limit) -> None:
+    model = make_model([], [])
+    model.max_seq_length = limit
+    with pytest.raises(ValueError, match="positive integer token limit"):
+        make_embedder(model).get_token_limit()
+
+
 @pytest.mark.parametrize("dimensions", [None, 0, -1, 1.5, "384", True])
 def test_invalid_model_dimensions_are_rejected(dimensions) -> None:
     model = make_model([], [])

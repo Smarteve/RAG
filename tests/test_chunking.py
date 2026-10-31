@@ -1,3 +1,4 @@
+from itertools import pairwise
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -100,6 +101,166 @@ def test_invalid_settings_are_rejected_even_without_pages(
 ) -> None:
     with pytest.raises(ValueError, match="Require chunk_size"):
         chunk_document(make_extraction(), chunk_size, overlap)
+
+
+def test_token_budget_preserves_existing_windows_when_they_fit() -> None:
+    extraction = make_extraction("ABCDEFGHIJK", "中文 café 🚀")
+    original = extraction.model_dump()
+    counter = Mock(return_value=3)
+
+    actual = chunk_document(extraction, 5, 2, count_tokens=counter, max_tokens=8)
+
+    assert actual == chunk_document(extraction, 5, 2)
+    assert extraction.model_dump() == original
+    assert [call.args[0] for call in counter.call_args_list] == [
+        chunk.text for chunk in actual
+    ]
+
+
+def test_token_budget_includes_special_tokens_and_keeps_exact_offsets() -> None:
+    text = "ABCDEFGHIJK"
+    chunks = chunk_document(
+        make_extraction(text),
+        10,
+        2,
+        count_tokens=lambda value: len(value) + 2,
+        max_tokens=8,
+    )
+
+    assert [(chunk.start_char, chunk.end_char) for chunk in chunks] == [
+        (0, 6),
+        (4, 10),
+        (8, 11),
+    ]
+    assert all(
+        chunk.text == text[chunk.start_char : chunk.end_char] for chunk in chunks
+    )
+    assert all(len(chunk.text) + 2 <= 8 for chunk in chunks)
+
+
+def test_chunks_shorter_than_requested_overlap_still_advance() -> None:
+    text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    chunks = chunk_document(
+        make_extraction(text),
+        count_tokens=lambda value: len(value) + 2,
+        max_tokens=5,
+    )
+
+    assert 0 < len(chunks) <= len(text)
+    assert chunks[0].start_char == 0
+    assert chunks[-1].end_char == len(text)
+    assert all(len(chunk.text) <= 3 for chunk in chunks)
+    assert all(left.start_char < right.start_char for left, right in pairwise(chunks))
+
+
+def test_token_counts_need_not_increase_with_prefix_length() -> None:
+    # Completing a word can reduce its token count. A shrinking estimate that
+    # misses the whole word must not claim that no valid split exists.
+    def count_tokens(text):
+        return 2 if text in {"abcdefg", "h"} else 100
+
+    chunks = chunk_document(
+        make_extraction("abcdefgh"),
+        8,
+        0,
+        count_tokens=count_tokens,
+        max_tokens=2,
+    )
+
+    assert [chunk.text for chunk in chunks] == ["abcdefg", "h"]
+
+
+def test_token_mode_skips_blank_windows_and_preserves_page_numbers() -> None:
+    extraction = make_extraction(" " * 20, " " * 12 + "ABC" + " " * 8, "Z")
+    chunks = chunk_document(
+        extraction, 5, 1, count_tokens=lambda value: len(value) + 2, max_tokens=6
+    )
+
+    assert {chunk.page_number for chunk in chunks} == {2, 3}
+    assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
+    for chunk in chunks:
+        source = extraction.pages[chunk.page_number - 1].text
+        assert chunk.text.strip()
+        assert chunk.text == source[chunk.start_char : chunk.end_char]
+        assert len(chunk.text) + 2 <= 6
+    assert any(chunk.text.startswith(" ") for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"count_tokens": len},
+        {"max_tokens": 5},
+        {"count_tokens": len, "max_tokens": 0},
+        {"count_tokens": len, "max_tokens": -1},
+    ],
+)
+def test_invalid_token_settings_are_rejected_without_pages(settings) -> None:
+    with pytest.raises(ValueError):
+        chunk_document(make_extraction(), **settings)
+
+
+def test_text_that_cannot_fit_raises_instead_of_truncating_or_looping() -> None:
+    with pytest.raises(ValueError, match="character 0 cannot fit"):
+        chunk_document(
+            make_extraction("A"),
+            count_tokens=lambda text: len(text) + 2,
+            max_tokens=2,
+        )
+
+
+def test_tokenizer_errors_are_not_swallowed() -> None:
+    error = RuntimeError("Tokenizer failed")
+    with pytest.raises(RuntimeError) as caught:
+        chunk_document(
+            make_extraction("Hello"),
+            count_tokens=Mock(side_effect=error),
+            max_tokens=5,
+        )
+    assert caught.value is error
+
+
+@given(
+    texts=st.lists(st.text(max_size=100), max_size=4),
+    chunk_size=st.integers(min_value=1, max_value=40),
+    overlap_fraction=st.integers(min_value=0, max_value=39),
+    content_budget=st.integers(min_value=1, max_value=40),
+)
+def test_generated_token_chunks_fit_and_cover_every_nonblank_character(
+    texts, chunk_size, overlap_fraction, content_budget
+) -> None:
+    extraction = make_extraction(*texts)
+    original = extraction.model_dump()
+    chunks = chunk_document(
+        extraction,
+        chunk_size,
+        min(overlap_fraction, chunk_size - 1),
+        count_tokens=lambda text: len(text) + 2,
+        max_tokens=content_budget + 2,
+    )
+
+    assert extraction.model_dump() == original
+    assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
+    for page in extraction.pages:
+        page_chunks = [
+            chunk for chunk in chunks if chunk.page_number == page.page_number
+        ]
+        assert len(page_chunks) <= len(page.text)
+        covered = set()
+        for chunk in page_chunks:
+            assert chunk.text.strip()
+            assert chunk.text == page.text[chunk.start_char : chunk.end_char]
+            assert len(chunk.text) <= min(chunk_size, content_budget)
+            assert chunk.document_id == extraction.document_id
+            covered.update(range(chunk.start_char, chunk.end_char))
+        assert all(
+            index in covered
+            for index, char in enumerate(page.text)
+            if not char.isspace()
+        )
+        assert all(
+            left.start_char < right.start_char for left, right in pairwise(page_chunks)
+        )
 
 
 def test_chunk_validation_error_is_not_swallowed(
