@@ -175,6 +175,12 @@ After the first-time setup above, start the stack with the development override:
 docker compose -f compose.yaml -f compose.dev.yaml up -d --wait
 ```
 
+Run this `up` command when first enabling development mode, even if the stack is
+already running. It recreates application containers as needed to apply the
+source mount, `PYTHONPATH`, and reload command. Passing both files to `exec` or
+`restart` alone does not apply those settings to an existing container. No image
+rebuild is needed when only these development settings or Python source changed.
+
 `compose.dev.yaml` mounts `./src` read-only at `/app/src` in the API, worker, and
 sweeper. It sets `PYTHONPATH=/app/src` so Python imports your current source
 instead of the package copy installed in the image. The existing shared data,
@@ -773,6 +779,9 @@ docker compose -f compose.yaml -f compose.dev.yaml exec api \
 
 Development mode loads the new evaluator from the mounted source. With the base
 Compose configuration alone, rebuild first and omit the two `-f` options.
+If Python reports `No module named nexusrag.evaluate_retrieval`, first run the
+development `up` command above; using the override with `exec` does not retrofit
+the source mount into a container started with the base configuration.
 `--output` saves the complete report to the host's
 `data/evaluations/handbook-token-aware.json` and prints a JSON summary. Omit it to
 print the full report instead. Use different filenames to retain separate runs.
@@ -817,6 +826,13 @@ small handbook produces only two chunks, so Hit@5 can include the whole document
 high scores here are a regression baseline, not evidence of general retrieval
 quality or improved chunking. Add harder, longer documents before drawing those
 conclusions.
+
+Documents indexed before the Qdrant integration may have no published
+`index_generation`. Evaluation rejects these legacy indexes even when their
+model and chunk digest match. Rebuild once with
+`POST /documents/{document_id}/semantic-index` in `/docs`, then rerun evaluation.
+This publishes a Qdrant generation from the saved chunks; it does not rechunk
+the document. The CLI also prints this rebuild instruction for stale indexes.
 
 ## Code responsibilities
 

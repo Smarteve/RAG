@@ -7,6 +7,7 @@ import pytest
 
 from nexusrag import evaluate_retrieval as cli
 from nexusrag.schemas.evaluation import RetrievalEvaluationReport
+from nexusrag.services.retrieval import StaleSemanticIndexError
 
 
 def report(document_id):
@@ -68,6 +69,23 @@ def test_cli_prints_full_report_without_an_output_file(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_run", AsyncMock(return_value=expected))
     assert cli.main([str(document_id)]) == 0
     assert "results" in json.loads(capsys.readouterr().out)
+
+
+def test_cli_stale_index_reports_rebuild_endpoint_without_writing_scores(
+    tmp_path, monkeypatch, capsys
+):
+    document_id = uuid4()
+    monkeypatch.setattr(
+        cli, "_run", AsyncMock(side_effect=StaleSemanticIndexError("internal details"))
+    )
+    destination = tmp_path / "report.json"
+    assert cli.main([str(document_id), "--output", str(destination)]) == 1
+    captured = capsys.readouterr()
+    assert f"POST /documents/{document_id}/semantic-index" in captured.err
+    assert "then rerun evaluation" in captured.err
+    assert "internal details" not in captured.err
+    assert not captured.out
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("value", ["0", "21"])

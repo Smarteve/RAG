@@ -15,6 +15,7 @@ from nexusrag.schemas.evaluation import RetrievalDataset, RetrievalEvaluationRep
 from nexusrag.services.embedding_runtime import EmbeddingRuntime
 from nexusrag.services.evaluation import EvaluationInputError, evaluate_retrieval
 from nexusrag.services.processing_lock import DocumentBusyError
+from nexusrag.services.retrieval import StaleSemanticIndexError
 from nexusrag.services.vector_backend import QdrantBackend
 
 
@@ -62,6 +63,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(summary, indent=2))
         else:
             print(report.model_dump_json(indent=2))
+    except StaleSemanticIndexError:
+        print(
+            "Semantic index is stale or incompatible. Rebuild it with "
+            f"POST /documents/{args.document_id}/semantic-index, "
+            "then rerun evaluation. Rebuilding uses the existing saved chunks.",
+            file=sys.stderr,
+        )
+        return 1
     except (EvaluationInputError, DocumentBusyError) as error:
         print(str(error), file=sys.stderr)
         return 1
